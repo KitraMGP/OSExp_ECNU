@@ -4,5 +4,6 @@
 int main()
 {
     print_init();
-    printf("1");
+    
+    printf("cpu %d is booting!\n", mycpuid());
 }

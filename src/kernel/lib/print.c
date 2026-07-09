@@ -50,19 +50,66 @@ static void printptr(uint64 x)
 }
 
 /*
-    标准化输出, 需要支持:
+    标准化输出, 支持:
     1. %d (32位有符号数,以10进制输出)
     2. %p (32位无符号数,以16进制输出)
     3. %x (64位无符号数,以0x开头的16进制输出)
     4. %c (单个字符)
     5. %s (字符串)
-    提示: stdarg.h中的va_list中包括你需要的参数地址
 */
 void printf(const char *fmt, ...)
 {
-    // 占位逻辑，用于测试
-    for (int i = 0; i < 16; i++)
-        uart_putc_sync(digits[i]);
+    spinlock_acquire(&print_lk);
+
+    if (fmt == NULL)
+        panic("printf: fmt is null");
+    
+    uint64 idx = 0;
+    va_list ap;
+    va_start(ap, fmt);
+    while (fmt[idx] != '\0')
+    {
+        if (fmt[idx] == '%')
+        {
+            if (fmt[idx + 1] == '\0')
+            {
+                uart_putc_sync('%');
+                idx++;
+                break;
+            }
+            switch (fmt[idx + 1])
+            {
+                case 'd':
+                    printint(va_arg(ap, int32), 10, 1);
+                    break;
+                case 'p':
+                    printptr(va_arg(ap, uint64));
+                    break;
+                case 'x':
+                    printint(va_arg(ap, int32), 16, 1);
+                    break;
+                case 'c':
+                    uart_putc_sync(va_arg(ap, int));
+                    break;
+                case 's':
+                    char* s = va_arg(ap, char*);
+                    if (s == NULL)
+                        s = "(NULL)";
+                    while(*s != '\0')
+                        uart_putc_sync(*(s++));
+                    break;
+                default:
+                    uart_putc_sync('%');
+                    uart_putc_sync(fmt[idx]);
+                    break;
+            }
+            idx += 2;
+        } else {
+            uart_putc_sync(fmt[idx++]);
+        }
+    }
+    
+    spinlock_release(&print_lk);
 }
 
 
