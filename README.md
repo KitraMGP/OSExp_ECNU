@@ -1,15 +1,15 @@
 # LAB-1: 机器启动
 
 ## 1. 代码组织结构
-```
+
+```plaintext
 ECNU-OSLAB-2025-TASK  
 ├── LICENSE        开源协议  
 ├── .vscode        配置了可视化调试环境
 ├── registers.xml  配置了可视化调试环境  
 ├── Makefile       编译运行整个项目  
 ├── common.mk      Makefile中一些工具链的定义  
-├── kernel.ld      定义了内核程序在链接时的布局  
-├── pictures       README使用的图片目录  
+├── kernel.ld      定义了内核程序在链接时的布局   
 ├── README.md      实验指导书  
 └── src            源码
     └── kernel     内核源码
@@ -34,89 +34,125 @@ ECNU-OSLAB-2025-TASK
         │   └── type.h  
         └── main.c (TODO)  
 ```
+
 ## 2. 实验核心目标
 
-完成双核的机器启动, 进入main函数并输出启动信息 (如下图)  
+完成双核的机器启动, 进入main函数并输出启动信息：
 
-## 3. 具体任务
-
-### 3.1 机器启动本身
-
-要想实现上述核心目标，仔细想想只需要完成两件事
-
-1. 让内核在在QEMU上跑起来（双核启动）：**entry.S** 到 **start.c** 到 **main.c**  
-
-2. 让内核向屏幕输出一些字符串，也就是实现C语言中经常调用的`printf()`
-
-第一件事需要你研究一下xv6的启动流程，只需要看到进入 **main.c** 就够了
-
-第二件事需要你先阅读一下**uart.c**，里面包括串口（最基本的字符输入输出设备）驱动
-
-读完之后你需要利用uart层的函数完成**print.c**中的函数，你可以参考xv6的实现，也可以自己去做
-
-### 3.2 printf面临的资源竞争问题
-
-串口是一种设备资源, `printf()`利用它输出字符本质是在一段时间内持有这种资源
-
-例如, 输出`"hello,world!"`其实是连续占用串口资源12次, 调用12次`uart_putc_sync()`
-
-假设同时存在第二个`printf()`执行流要打印`"hello,os!"`, 它就会与执行流1形成竞争关系
-
-两条执行流交错带来的输出可能包括:
-
-```
-# 混乱的情况
-hellohello,,world!os!
-hheelllloo,,wosrld!!
-hhello,world!ello,os!
-......
-# 有序的情况
-hello,world!hello,os!
-hello,os!hello,world!
+```plaintext
+cpu 1 is booting!
+cpu 0 is booting!
 ```
 
-我们需要一种手段, 保证`printf()`过程中, UART资源始终只被一个执行流占有同时不可抢占
+## 3. 具体工作
 
-生活中的例子: 公共卫生间通过"门锁"来保证马桶这一资源在一段时间内只被一人独占
+### 3.1 配置开发环境
 
-影射到操作系统, 最简单的"资源锁"就是“自旋锁”, 它的实现位于**spinlock.c**
+在 Arch Linux 中，安装适用于 `riscv64` 的 QEMU 和 GCC 工具链：
 
-```
-# 在printf中使用自旋锁的方法
-
-spinlock_t lk;
-
-# 锁的初始化
-spinlock_init(&lk, "print_lk");
-
-# 上锁
-spinlock_acquire(&lk);
-
-# 独占资源
-uart_putc_sync();
-uart_putc_sync();
-......
-
-# 解锁
-spinlock_release(&lk);
-
+```bash
+sudo pacman -S qemu-system-riscv riscv64-elf-gcc riscv64-elf-gdb
 ```
 
-自旋锁的可靠性依赖**开关中断**和**原子操作**这两个关键概念，你需要完全理解
+编辑 `common.mk` 文件，调整编译选项：
 
-- 开关中断可以保证单CPU情况下进程(执行流)切换的时候不会影响上锁操作的原子性
+```Makefile
+# 将 GCC 工具链前缀改成实际安装的名称
+TOOLPREFIX = riscv64-elf-
 
-- 原子操作可以保证多CPU的情况下并行执行流不会同时上锁成功
+# -std=gnu17 指定使用 C17 标准，默认最新 C 标准内置了 bool 类型会和 src/kernel/arch/type.h 单独定义的 bool 类型冲突
+# -Wno-error=unused-function 防止出现“函数未使用”报错导致无法编译，设置后它只会展示为警告
+CFLAGS += -std=gnu17 -Wno-error=unused-function
+```
 
-完成上述工作后，你应当可以实现图片所示的效果 (在**main.c**的合适位置输出这两句话)  
+### 3.2 编辑引导代码
+
+编辑 `src/kernel/boot/start.c`，在 `start()` 中添加代码：
+
+```c
+void start()
+{
+    // ...
+
+    // 配置PMP，允许S-mode访问全部物理内存
+    // 否则mret进入S-mode后CPU取指立即被PMP拦截
+    w_pmpaddr0(0x3fffffffffffffull);
+    w_pmpcfg0(0xf);
+
+    // 设置M-mode的返回地址
+    w_mepc((uint64) main);
+    // 触发状态迁移，回到上一个状态（M-mode->S-mode）
+    asm volatile("mret");
+}
+```
+
+在我的环境下，必须配置PMP才能正常引导到main()。start()的最后两条语句用于转移到S-mode并运行main()函数。
+
+为了测试是否到达main()函数，可用GDB来调试内核。在项目根目录编写`.gdbinit`：
+
+```plaintext
+set confirm off
+set architecture riscv:rv64
+target remote 127.0.0.1:26000
+symbol-file target/kernel/kernel-qemu.elf
+set disassemble-next-line auto
+```
+
+启动QEMU并等待调试器连接：
+
+```bash
+make debug
+```
+
+启动GDB：
+
+```bash
+riscv64-elf-gdb
+```
+
+进入调试器后，使用命令`b main`即可在main()设置断点，用`c`命令即可继续执行到断点。其他常见GDB命令示例：
+
+```plaintext
+# 运行到当前文件第25行
+until 25
+# 在start.c:25处设置断点
+b src/kernel/boot/start.c:25
+# 在当前文件25行设置临时断点（到达后自动删除）
+tb 25
+# 单步执行（进入函数）
+step
+# 单步执行一条汇编指令（进入函数）
+stepi
+# 单步执行（跳过函数）
+next
+# 单步执行一条汇编指令（跳过函数）
+next
+```
+
+可以给printf()编写一个简易占位实现，从而在主函数中测试串口是否能正常打印。
+
+### 3.3 实现自旋锁
+
+自旋锁是一种最简单的锁，可以确保共享资源在同一时刻只被一个CPU核使用，自旋锁的实现要点：
+
+- 获取锁后要关中断，防止自旋等待被中断
+- 要用原子操作获取和释放锁，避免多个核心同时获得锁
+
+具体自旋锁实现说明见`src/kernel/lock/spinlock.c`。
+
+### 3.4 实现printf函数
+
+printf函数用来向串口打印格式化字符串，串口属于共享资源，需要用锁来保证同一时刻只有一个CPU核在打印字符。
+
+具体printf实现见`src/kernel/lib/print.c`。
 
 ## 4. 课后实验
 
-这里有两个额外的实验帮助你理解锁的用处 
+这里有两个额外的实验帮助你理解锁的用处
 
 ### 4.1 并行加法
 
-``` 
+```c
     volatile static int started = 0;
 
     volatile static int sum = 0;
