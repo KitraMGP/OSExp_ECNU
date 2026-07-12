@@ -129,5 +129,8 @@ void panic(const char *s)
 /* 如果不满足条件, 则调用panic */
 void assert(bool condition, const char *warning)
 {
-
+    if (condition)
+        return;
+    printf("assert failed: %s\n", warning);
+    panic("assert failed!");
 }

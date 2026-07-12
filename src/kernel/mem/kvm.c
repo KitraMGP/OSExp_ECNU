@@ -9,7 +9,33 @@ static pgtbl_t kernel_pgtbl;
 // 提示：使用 VA_TO_VPN + PTE_TO_PA + PA_TO_PTE
 pte_t *vm_getpte(pgtbl_t pgtbl, uint64 va, bool alloc)
 {
-    return NULL;
+    // 从顶级页表向下查找
+    for (int level = 2; level > 0; level--)
+    {
+        // VA_TO_VPN(va, level) 获取虚拟地址对应的虚拟页表项编号
+        // pgtbl[VPN] 获取页表项
+        // &pgtbl[VPN] 获取页表项的地址
+        // 取页表项指针的原因是，PTE 无效且 alloc = true 时，需要通过指针将新页面写回页表项
+        // 返回页表项指针的原因也是为了调用方写入页表项
+        pte_t* pte = &pgtbl[VA_TO_VPN(va, level)];
+        if (*pte & PTE_V)
+        {
+            // PTE 有效，进入下一级页表
+            pgtbl = (pgtbl_t)PTE_TO_PA(*pte);
+        } else {
+            // PTE 无效，根据 alloc 判断是否分配新页表页
+            if (!alloc)
+                return NULL;
+            uint64 new_page = (uint64)pmem_alloc(true);
+            assert(new_page != 0, "vm_getpte: pmem_alloc() returned 0.");
+            // pmem_alloc 已保证页面清零
+            // memset((void*)new_page, 0, PGSIZE);
+            *pte = PA_TO_PTE(new_page) | PTE_V;
+            pgtbl = (pgtbl_t)new_page;
+        }
+    }
+    // 第 0 层，返回 PTE 指针
+    return &pgtbl[VA_TO_VPN(va, 0)];
 }
 
 // 在pgtbl中建立 [va, va + len) -> [pa, pa + len) 的映射
@@ -18,7 +44,7 @@ pte_t *vm_getpte(pgtbl_t pgtbl, uint64 va, bool alloc)
 // 注意: perm 应该如何使用
 void vm_mappages(pgtbl_t pgtbl, uint64 va, uint64 pa, uint64 len, int perm)
 {
-
+    
 }
 
 // 解除pgtbl中[va, va+len)区域的映射

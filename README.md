@@ -212,3 +212,113 @@ void pmem_init(void)
 ##### 测试
 
 所有的测试用例均测试通过。
+
+#### 3.1.3 上一节实现过程中遇到的问题
+
+运行第一组测试用例的时候，在释放已分配的块的时候出现了`panic: spinlock_acquire`错误。调试发现，
+
+GDB调试信息：
+
+```
+(gdb) b src/kernel/lock/spinlock.c:56
+Breakpoint 1 at 0x80000818: file src/kernel/lock/spinlock.c, line 56.
+(gdb) c
+Continuing.
+
+Thread 1 hit Breakpoint 1, spinlock_acquire (lk=lk@entry=0x80005398 <kern_region+16>) at src/kernel/lock/spinlock.c:56
+56              panic("spinlock_acquire");
+(gdb) p lk->name
+$1 = 0x800011d8 "kern_region"
+(gdb) bt
+#0  spinlock_acquire (lk=lk@entry=0x80005398 <kern_region+16>) at src/kernel/lock/spinlock.c:56
+#1  0x0000000080000bdc in pmem_free (page=2147532800, in_kernel=in_kernel@entry=true) at src/kernel/mem/pmem.c:81
+#2  0x00000000800001dc in main () at src/kernel/main.c:32
+```
+
+研究后发现，问题出在spinlock的实现中存在竞争问题，`spinlock_t.locked`在锁没有被占用和被CPU0占用时均取值为0，在并发执行时，`spinlock_acquire()`函数中的`spinlock_holding()`调用会错误地判断本核心已持有锁，产生报错。
+
+出错时的具体操作序列：
+
+```
+CPU1: 进入spinlock_release(&lk);
+CPU1: lk->cpuid = 0; // 清零 cpuid
+CPU0: 进入spinlock_acquire(&lk);
+CPU0: 进入spinlock_holding(&lk);
+CPU0: r = (lk->locked && lk->cpuid == mycpuid());
+// 此时 lk->locked == 1，lk->cpuid == 0，函数认为锁被 CPU0 持有，触发 panic
+// 但实际上锁被 CPU1 持有（正在释放），出现了误判
+```
+
+要解决这个bug，就要避免清零cpuid后被误判成CPU0持有锁，方法是让特殊值-1代表无人持有锁，释放锁的时候执行`lk->cpuid = -1;`，`spinlock_holding()`不会出现误判。此外，自旋锁初始化函数`spinlock_init`中也一致地将`lk->cpuid`设为-1。
+
+### 3.2 内核态虚拟内存
+
+由于应用程序要求能独占整个地址空间，并且各个程序持有的内存需要有记录，因此需要有虚拟内存管理。
+
+实现基于内核态的虚拟内存管理，使用三级页表管理。
+
+#### 3.2.1 内核态虚拟内存：页表+页表项
+
+在RIST-V体系结构中，要建立页表并通过MMU自动完成翻译，需要遵循SV39规范，即39bit虚拟地址的虚拟内存，该规范在`src/kernel/mem/type.h`的注释中介绍。
+
+```c
+/*
+    内核使用RISC-V体系结构中的SV39作为虚拟内存的设计规范
+
+    1. 页表与satp寄存器
+    
+    satp寄存器的bit结构: MODE(4bit) + ASID(16bit) + PPN(44bit)
+    - MODE控制虚拟内存模式
+    - ASID与Flash刷新有关
+    - PPN存放页表基地址
+    可以通过w_satp(MAKE_SATP(pgtbl))命令将页表地址填入satp寄存器并启动地址翻译
+    在无页表到有页表 + 切换页表的情况下会用到
+
+    2. SV39的虚拟地址与三级映射表
+
+    物理页是最基本的内存资源, 有的物理页用于存放数据, 有的物理页用于存放描述"物理页映射关系"的页表
+    VA: VPN[2] + VPN[1] + VPN[0] + offset
+          9    +   9    +   9    +   12    = 39 (使用uint64存储) => 最大虚拟地址为512GB
+    SV39使用三级页表对应三级VPN, VPN[2]称为顶级页表、VPN[1]称为次级页表、VPN[0]称为低级页表
+    为什么每一级页框号是"9": 4KB/sizeof(PTE) = 512 = 2^9 所以一个物理页可以存放512个页表项
+    生活中的例子: 假设你要在全国范围内找一个不认识的大学老师, 
+    - 你可以先到教育部(顶级页表)查询, 得知这个老师属于大学A
+    - 你接着来到大学A(次级页表)查询, 得知这个老师属于学院B
+    - 你最后来到学院B(低级页表)查询, 得知这个老师属于办公室C
+    - 最后你来到办公室C(物理页), 并在某个位置(offset)上找到了他
+
+    3. 页表的基本组成单位-页表项(PTE)
+    reserved + PPN[2] + PPN[1] + PPN[0] + RSW + D A G U X W R V  共64bit
+       10        26       9        9       2    1 1 1 1 1 1 1 1
+    需要关注的部分:
+    - V : valid
+    - X W R : execute write read (全0意味着这是页表所在的物理页)
+    - U : 用户态是否可以访问
+    - PPN区域 : 存放物理页号
+
+*/
+```
+
+页表（pgtbl）由页表项（PTE）构成，一个页表项对应一个物理页，页表项主要由两部分组成：
+
+- 它所管理的物理页的页号（PPN字段）
+- 它所管理的物理页的标志位（低10bit）
+
+页表本身也是存放在物理页中，这种物理页的特点是PTE的标志位中PTR_R PTE_W PTE_X都是0（不可读不可写不可执行）
+
+下图显示了页表的示意图和实际状态：
+
+![页表示意图](img/img2.jpg)
+
+页表刚初始化的时候只是一个清空的4KB物理页， 随着mmap操作的增加，页表开始延伸出去，直到完全长成一个能管理512GB内存空间的树。
+
+页表的三级组织结构：
+
+- 顶级页表的PTE中有次级页表所在的物理页的物理页号和标志位
+- 次级页表的PTE中有低级页表所在的物理页的物理页号和标志位
+- 低级页表的PTE中有一般物理页的物理页号和标志位
+
+##### 实现虚拟内存管理
+
+需要依次实现`vm_getpte`、`vm_mappages`、`vm_unmappages`三个函数。
+
