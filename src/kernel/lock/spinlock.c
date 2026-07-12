@@ -32,12 +32,12 @@ void pop_off(void)
 }
 
 
-// 自选锁初始化
+// 自旋锁初始化
 void spinlock_init(spinlock_t *lk, char *name)
 {
     lk->name = name;
     lk->locked = 0;
-    lk->cpuid = 0;
+    lk->cpuid = -1; // -1 代表无人持有
 }
 
 // 是否持有自旋锁
@@ -71,7 +71,7 @@ void spinlock_release(spinlock_t *lk)
 {
     if (!spinlock_holding(lk))
         panic("spinlock_release");
-    lk->cpuid = 0;
+    lk->cpuid = -1;
 
     // 确保前后语句执行顺序不被改变
     __sync_synchronize();
