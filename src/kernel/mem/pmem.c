@@ -53,7 +53,7 @@ void* pmem_alloc(bool in_kernel)
         spinlock_release(&kern_region.lk);
     } else {
         spinlock_acquire(&user_region.lk);
-        if (user_region.list_head.next == NULL || kern_region.allocable == 0)
+        if (user_region.list_head.next == NULL || user_region.allocable == 0)
         {
             panic("pmem_alloc() failed: no available physical pages in user region.");
         } else {
@@ -72,15 +72,22 @@ void* pmem_alloc(bool in_kernel)
 
 // 释放一个物理页
 // 失败则panic锁死
-void pmem_free(uint64 page, bool in_kernel)
+void pmem_free(uint64 page)
 {
     if (page == 0)
         panic("pmem_free(): attempt to free page NULL.");
+    bool in_kernel = false;
+    if (page >= kern_region.begin && page < kern_region.end)
+    {
+        in_kernel = true;
+    } else if (page >= user_region.begin && page < user_region.end) {
+        in_kernel = false;
+    } else {
+        panic("pmem_free(): illegal page.");
+    }
     if (in_kernel)
     {
         spinlock_acquire(&kern_region.lk);
-        if (page < kern_region.begin || page > kern_region.end)
-            panic("pmem_free(): illegal kernel page.");
         // 将页面插入链表头部
         page_node_t* page_ptr = (page_node_t*)page;
         page_ptr->next = kern_region.list_head.next;
@@ -89,8 +96,6 @@ void pmem_free(uint64 page, bool in_kernel)
         spinlock_release(&kern_region.lk);
     } else {
         spinlock_acquire(&user_region.lk);
-        if (page < user_region.begin || page > user_region.end)
-            panic("pmem_free(): illegal kernel page.");
         // 将页面插入链表头部
         page_node_t* page_ptr = (page_node_t*)page;
         page_ptr->next = user_region.list_head.next;

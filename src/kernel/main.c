@@ -11,19 +11,23 @@ int main()
     {
         print_init();
         pmem_init();
-        printf("cpu %d is booting!\n", cpuid);
+        kvm_init();
+
         __sync_synchronize();
         started = 1;
-        
     }
     else
     {
         while (started == 0)
             ;
         __sync_synchronize();
-        printf("cpu %d is booting!\n", cpuid);
     }
+
+    // 两个 CPU 都需要调用
+    kvm_inithart();
+
+    printf("cpu %d is booting!\n", cpuid);
+
     while (1)
         ;
 }
-
