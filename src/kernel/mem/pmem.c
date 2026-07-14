@@ -76,6 +76,8 @@ void pmem_free(uint64 page)
 {
     if (page == 0)
         panic("pmem_free(): attempt to free page NULL.");
+    if (page % PGSIZE != 0)
+        panic("pmem_free(): page is not page-aligned.");
     bool in_kernel = false;
     if (page >= kern_region.begin && page < kern_region.end)
     {
