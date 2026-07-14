@@ -184,29 +184,161 @@ printf函数用来向串口打印格式化字符串，串口属于共享资源�
 
 但是实际结果可能是这样的  
 
-```
+```plaintext
 cpu 0 is booting!
 cpu 1 is booting!
 cpu 0 report: sum = 1128497
 cpu 1 report: sum = 1143332
 ```
 
-考虑如何使用锁进行修正，修正后的输出可能是这样的  
+使用锁进行修正，修正后的输出可能是这样的  
 
-```
+```plaintext
 cpu 0 is booting!
 cpu 1 is booting!
 cpu 0 report: sum = 1996573
 cpu 1 report: sum = 2000000
 ```
 
+上述例子的修复代码：
+
+```c
+volatile static int started = 0;
+
+volatile static int sum = 0;
+
+static spinlock_t lock;
+
+int main()
+{
+    int cpuid = r_tp();
+    if (cpuid == 0)
+    {
+        print_init();
+        spinlock_init(&lock, "add"); // 初始化锁
+        printf("cpu %d is booting!\n", cpuid);
+        __sync_synchronize();
+        started = 1;
+        for (int i = 0; i < 1000000; i++)
+        {
+            spinlock_acquire(&lock);
+            sum++;
+            spinlock_release(&lock);
+        }
+        printf("cpu %d report: sum = %d\n", cpuid, sum);
+    }
+    else
+    {
+        while (started == 0)
+            ;
+        __sync_synchronize();
+        printf("cpu %d is booting!\n", cpuid);
+        for (int i = 0; i < 1000000; i++)
+        {
+            spinlock_acquire(&lock);
+            sum++;
+            spinlock_release(&lock);
+        }
+        printf("cpu %d report: sum = %d\n", cpuid, sum);
+    }
+    while (1)
+        ;
+}
+```
+
 简单说明上锁和解锁的位置不同会有什么影响（tips: 锁的粒度粗细）
+
+若给整个for循环上锁：
+
+```c
+spinlock_acquire(&lock);
+for (int i = 0; i < 1000000; i++)
+{
+    sum++;
+}
+pinlock_release(&lock);
+```
+
+输出结果是：
+
+```plaintext
+cpu 0 is booting!
+cpu 1 is booting!
+cpu 0 report: sum = 1000000
+cpu 1 report: sum = 2000000
+```
+
+而只给`sum++`代码上锁的情况输出结果是：
+
+```plaintext
+cpu 0 is booting!
+cpu 1 is booting!
+cpu 0 report: sum = 1997921
+cpu 1 report: sum = 2000000
+```
+
+不同粒度的锁的效果对比：
+
+1. 给整个for循环上锁，会确保每个核心依次执行完自己的for循环，核心执行完所有循环，下一个核心才能开始执行循环；
+
+2. 只给自增操作`sum++`上锁，确保两个核心不会同时操作sum变量，确保了自增操作的原子性，只能够保证所有核心执行完后的**最终结果**是正确的（2000000），在最后一个核心循环结束之前，其他核心打印的`sum`值都是正在被自增的中间结果。
 
 ### 4.2 并行输出  
 
 尝试去掉`printf`里的锁，参考4.1的实验思路，设计测试方法使得`printf`的输出出现交错的情况  
 
-4.1和4.2的测试代码和实验结果可以附在你的README中, 但是不要体现在你的代码里
+考虑以下测试代码：
+
+```c
+volatile static bool started = false;
+
+int main()
+{
+    if (mycpuid() == 0)
+    {
+        print_init();
+        __sync_synchronize();
+        started = true;
+        for (int i = 0; i < 10; i++)
+            printf("Hello World!\n");
+    } else {
+        while (!started);
+        __sync_synchronize();
+        for (int i = 0; i < 10; i++)
+            printf("Hello World!\n");
+    }
+}
+```
+
+这段代码会在每个核心分别打印10次`Hello World`，运行结果如下：
+
+```plaintext
+Hello World!
+Hello World!
+Hello World!
+Hello World!
+Hello World!
+Hello World!
+...
+```
+
+若去掉`printf()`中的锁，运行结果如下：
+
+```plaintext
+HHello World!
+ello World!
+Hello World!
+Hello World!
+HelloHello World!
+Hello World!
+ World!
+Hello World!
+Hello World!
+Hello World!
+...
+```
+
+两个核心同时调用`printf()`进行打印，导致打印的内容交叉混乱。这证明了`printf()`要采用锁来确保同一时刻只有一个核心使用的必要性。
 
 ## 5. 关于代码仓库的维护
 
@@ -222,8 +354,7 @@ cpu 1 report: sum = 2000000
 
     文档内容不做明确要求，你有很高的自由度决定写什么和写多少
 
-    提供一些建议: 
-    
+    提供一些建议:
     - 本次实验新增了哪些功能，实现了什么效果
 
     - 对本次实验中某个过程的理解和思考
@@ -235,7 +366,7 @@ cpu 1 report: sum = 2000000
     - 可以使用markdown的分层分点来增加条理性，便于别人阅读和抓住重点
 
     **总之，这是你的代码仓库，请对你自己的代码和文档负责**  
-    
+
     **注意，代码是继承和连续发展的, 但文档不是，每次的文档都是全新一页**  
 
 3. 提醒: 之所以要求大家维护代码仓库，是为了查看大家的提交记录
