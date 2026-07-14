@@ -45,16 +45,27 @@ static timer_t sys_timer __attribute__((unused));
 // 时钟创建
 void timer_create()
 {
+    spinlock_init(&sys_timer.lk, "sys_timer");
+    spinlock_acquire(&sys_timer.lk);
+    sys_timer.ticks = 0;
+    spinlock_release(&sys_timer.lk);
 }
 
 // 时钟更新
 void timer_update()
 {
+    spinlock_acquire(&sys_timer.lk);
+    sys_timer.ticks++;
+    spinlock_release(&sys_timer.lk);
+    // printf("ticks=%d\n", timer_get_ticks());
 }
 
 // 获取滴答数量 (不把sys_timer暴露出去, 只提供安全的访问接口)
 uint64 timer_get_ticks()
 {
-    // TODO: 实现加锁读取后移除此占位返回值
-    return 0;
+    uint64 ticks;
+    spinlock_acquire(&sys_timer.lk);
+    ticks = sys_timer.ticks;
+    spinlock_release(&sys_timer.lk);
+    return ticks;
 }

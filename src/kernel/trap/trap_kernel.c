@@ -88,7 +88,12 @@ void trap_kernel_handler()
         // 1-中断处理
         switch (trap_id) // 中断产生原因分类
         {
-
+        case 1: // S 模式软件中断
+            timer_interrupt_handler();
+            break;
+        case 9: // S 模式外设中断
+            external_interrupt_handler();
+            break;
         default: // 例外处理
             printf("\nunexpected interrupt: %s\n", interrupt_info[trap_id]);
             printf("trap_id = %d, sepc = %p, stval = %p\n", trap_id, sepc, stval);
@@ -112,6 +117,14 @@ void trap_kernel_handler()
 // 外设中断处理 (基于PLIC，lab-3只需要识别和处理UART中断)
 void external_interrupt_handler()
 {
+    int irq = plic_claim();
+    // printf("external interrupt handled %d\n", irq);
+    // UART 中断
+    if (irq == UART_IRQ)
+    {
+        uart_intr();
+    }
+    plic_complete(irq);
 }
 
 // 时钟中断处理 (基于CLINT)
@@ -123,6 +136,8 @@ void timer_interrupt_handler()
         timer_update();
     // 清除 SSIP bit (S-mode software interrupt pending)
     // 宣布 S-mode 软件中断处理完成
-    // 在 trap.S 里面有对应的两条命令, 去找找
+    // 在 trap.S 里面有相反的命令操作:
+    // li a1, 2
+    // csrw sip, a1
     w_sip(r_sip() & ~2);
 }

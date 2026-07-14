@@ -62,11 +62,52 @@ int uart_getc_sync(void)
 // 中断处理(键盘输入->屏幕输出)
 void uart_intr(void)
 {
+	// 记录当前输入行字符数
+	static uint32 line_chars = 0;
+	// 上一个字符是否是 CR
+	static bool previous_cr = false;
 	while (1)
 	{
 		int c = uart_getc_sync();
 		if (c == -1)
 			break;
+		// 处理换行
+		// 若有 CRLF 组合，只识别成一次换行
+		if (c == '\r')
+		{
+			previous_cr = true;
+			uart_putc_sync('\r');
+			uart_putc_sync('\n');
+			line_chars = 0;
+			continue;
+		} else if (c == '\n') {
+			// CRLF 组合中 CR 已经执行换行
+			if (!previous_cr)
+			{
+				uart_putc_sync('\r');
+				uart_putc_sync('\n');
+				line_chars = 0;
+			}
+			previous_cr = false;
+			continue;
+		} else {
+			// 不是 CR 也不是 LF
+			previous_cr = false;
+		}
+		// 处理退格
+		// '\b' 代表退格符，0x7f 代表删除符
+		// '\b' 的作用只是将光标左移 1 字符，因此需要输出空格来覆盖掉要删除的字符
+		if (c == '\b' || c == 0x7f)
+		{
+			if (line_chars == 0)
+				continue;
+			uart_putc_sync('\b');
+			uart_putc_sync(' ');
+			uart_putc_sync('\b');
+			line_chars--;
+			continue;
+		}
+		line_chars++;
 		uart_putc_sync(c);
 	}
 }

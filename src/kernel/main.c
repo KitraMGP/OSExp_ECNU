@@ -14,7 +14,9 @@ int main()
         pmem_init();
         kvm_init();
 
-        // TODO: 初始化所有hart共享的trap资源
+        // 初始化所有hart共享的trap资源
+        trap_kernel_init();
+        plic_init();
 
         __sync_synchronize();
         started = 1;
@@ -29,7 +31,9 @@ int main()
     // 两个 CPU 都需要调用
     kvm_inithart();
 
-    // TODO: 初始化当前hart独有的trap资源
+    // 初始化当前hart独有的trap资源
+    trap_kernel_inithart();
+    plic_inithart();
 
     printf("cpu %d is booting!\n", cpuid);
 
