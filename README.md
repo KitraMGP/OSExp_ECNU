@@ -1,389 +1,349 @@
-# LAB-2: 内存管理
+# LAB-2：内存管理
 
-## 1. 代码组织结构
+本实验在 RISC-V64 QEMU `virt` 平台上实现物理页分配器和 Sv39 内核页表。实现参考 xv6-riscv，但按本项目的模块划分、函数签名和内存布局进行了适配。
 
-```plaintext
-ECNU-OSLAB-2025-TASK
-├── LICENSE        开源协议
-├── .vscode        配置了可视化调试环境
-├── registers.xml  配置了可视化调试环境
-├── common.mk      Makefile中一些工具链的定义
-├── Makefile       编译运行整个项目 (CHANGE, 增加trap和mem目录作为target)
-├── kernel.ld      定义了内核程序在链接时的布局 (CHANGE, 增加一些关键位置的标记)
-├── pictures       README使用的图片目录 (CHANGE, 日常更新)
-├── README.md      实验指导书 (CHANGE, 日常更新)
-└── src            源码
-    └── kernel     内核源码
-        ├── arch   RISC-V相关
-        │   ├── method.h
-        │   ├── mod.h
-        │   └── type.h
-        ├── boot   机器启动
-        │   ├── entry.S
-        │   └── start.c
-        ├── lock   锁机制
-        │   ├── spinlock.c
-        │   ├── method.h
-        │   ├── mod.h
-        │   └── type.h
-        ├── lib    常用库
-        │   ├── cpu.c
-        │   ├── print.c
-        │   ├── uart.c
-        │   ├── utils.c (NEW, 工具函数)
-        │   ├── method.h (CHANGE, utils.c的函数声明)
-        │   ├── mod.h
-        │   └── type.h
-        ├── mem    内存模块
-        │   ├── pmem.c (TODO, 物理内存管理)
-        │   ├── kvm.c (TODO, 内核态虚拟内存管理)
-        │   ├── method.h (NEW)
-        │   ├── mod.h (NEW)
-        │   └── type.h (NEW)
-        ├── trap   陷阱模块
-        │   ├── method.h (NEW)
-        │   ├── mod.h (NEW)
-        │   └── type.h (NEW, 增加CLINT和PLIC寄存器定义)
-        └── main.c (TODO)
+## 1. 实验概览
+
+### 1.1 已完成内容
+
+| 模块 | 完成内容 | 核心入口 |
+| --- | --- | --- |
+| 链接布局 | 划分代码、数据和可分配 RAM，导出边界符号 | `kernel.ld` |
+| 物理内存 | 双空闲链表、4 KiB 页分配/释放、分配清零 | `pmem_init`、`pmem_alloc`、`pmem_free` |
+| 并发保护 | 内核池和用户池分别使用自旋锁保护 | `spinlock_acquire`、`spinlock_release` |
+| 页表操作 | 三级页表遍历、映射、解映射和调试打印 | `vm_getpte`、`vm_mappages`、`vm_unmappages`、`vm_print` |
+| 内核页表 | MMIO 与 RAM 恒等映射，代码页只读可执行 | `kvm_init` |
+| 启用分页 | 每个 hart 写入 `satp` 并刷新本地 TLB | `kvm_inithart` |
+
+当前阶段只实现内核共享页表。用户进程页表、页表销毁、缺页处理和 TLB shootdown 不在本实验范围内。
+
+### 1.2 平台配置
+
+| 配置 | 当前值 | 定义位置 |
+| --- | --- | --- |
+| 架构 | RISC-V 64-bit | `common.mk`、`kernel.ld` |
+| QEMU 机器 | `virt`，无 BIOS | `Makefile` |
+| RAM | 128 MiB | `Makefile` 中 `-m 128M` |
+| hart 数量 | 2 | `CPUNUM` 和 `NCPU` |
+| 页大小 | 4096 bytes | `PGSIZE` |
+| 虚拟内存模式 | Sv39 | `SATP_SV39` |
+
+`CPUNUM`、`NCPU`、QEMU RAM 大小和 `ALLOC_END`是相互关联的配置，修改时必须同步核对。
+
+## 2. 快速开始
+
+需要安装 `riscv64-elf-*` 交叉工具链和 `qemu-system-riscv64`。
+
+```sh
+make clean
+make build
+make run
 ```
 
-## 2. 实验核心目标
+QEMU 在 `-nographic` 模式下运行，按 `Ctrl-a x`退出。内核启动成功时会输出以下两行，顺序可能因 hart 调度而变化：
 
-- 实现物理内存的分页管理、分配、回收
-- 实现内核态虚拟内存管理
-
-## 3. 具体工作
-
-### 3.1 物理内存管理
-
-#### 3.1.1 kernel.ld
-
-首先需要关注`kernel.ld`文件，它规定了内核可执行文件`kernel-qemu.elf`在载入内存时的布局。
-
-`kernel.ld`结构：
-
-```
-OUTPUT_ARCH("riscv")
-ENTRY(_entry)
-
-SECTIONS
-{
-  . = 0x80000000;       // 设定起始地址（加载地址）
-
-  .text : { ... }       // .text 段
-  .rodata : { ... }     // .rodata 段
-  .data : { ... }       // .data 段
-  .bss : { ... }        // .bss 段
-}
+```text
+cpu 0 is booting!
+cpu 1 is booting!
 ```
 
-这个脚本规定了：
+构建产物位于 `target/kernel/kernel-qemu.elf`。常用检查命令：
 
-- 起始地址：0x80000000，规定了所有段的虚拟地址从这里开始。
-
-- 段的排列顺序：.text，.rodata，.data，.bss。
-- 对齐要求：`. = ALIGN(16)`或`. = ALIGN(0x1000)`确保段/节的地址对齐。
-- 导出符号：`PROVIDE(etext = .)`，`PROVIDE(ALLOC_BEGIN = .)`等，把这些地址作为符号提供给C/汇编代码使用。
-
-布局信息被链接器写入到ELF文件的头部：
-
-- Program Headers（程序头表/段表）：每个段（segment）的`p_vaddr`（虚拟地址）、`p_offset`（文件偏移）、`p_filesz/p_memsz`（大小）。这是加载器（QEMU、bootloader）用来将内核载入内存的元数据。
-- Section Headers（节头表）：每个节（如.text、.data）的`sh_addr`、`sh_offset`等更细粒度的布局信息。
-
-可用`readelf -l kernel-qemu.elf`看到实际写入ELF的Program Headers；可用`readelf -S kernel-qemu.elf`看到各个节的地址信息。
-
-在本项目中，在最后一个段的后面添加以下代码，它导出了物理内存分配的起止地址：
-
-```plaintext
-. = ALIGN(4096);
-PROVIDE(ALLOC_BEGIN = .);
-PROVIDE(ALLOC_END = 0x80000000 + 128M);
+```sh
+riscv64-elf-readelf -l -S -s target/kernel/kernel-qemu.elf
+riscv64-elf-nm -n target/kernel/kernel-qemu.elf
+riscv64-elf-objdump -S target/kernel/kernel-qemu.elf
 ```
 
-编辑.text段，导出KERNEL_DATA符号：
+链接器目前会提示 ELF 存在 RWE LOAD segment。ELF 仍由一个 LOAD segment 装载，但启用 Sv39 后，页表会将内核代码映射为 `R|X`、其余 RAM 映射为 `R|W`。
 
+## 3. 代码导航与启动流程
+
+### 3.1 核心文件
+
+| 文件 | 职责 |
+| --- | --- |
+| `kernel.ld` | 定义内核 section 顺序和 `KERNEL_DATA`、`ALLOC_BEGIN`、`ALLOC_END` |
+| `src/kernel/mem/type.h` | 物理页、分配区域、页表、PTE 和地址转换宏 |
+| `src/kernel/mem/method.h` | 内存模块公开接口 |
+| `src/kernel/mem/pmem.c` | 内核池与用户池的初始化、分配和释放 |
+| `src/kernel/mem/kvm.c` | 通用页表操作、内核映射和分页启用 |
+| `src/kernel/lock/spinlock.c` | 分配器使用的自旋锁和中断嵌套控制 |
+| `src/kernel/boot/entry.S` | 为每个 hart 选择启动栈并进入 C 代码 |
+| `src/kernel/boot/start.c` | M-mode 初始化、PMP 配置和切换到 S-mode |
+| `src/kernel/main.c` | hart 0 初始化共享资源，所有 hart 启用内核页表 |
+| [`TESTING.md`](TESTING.md) | 阶段性测试代码、实际输出、预期失败和覆盖缺口 |
+
+原理图：
+
+- [空闲物理页链表](img/img1.jpg)
+- [三级页表示意图](img/img2.jpg)
+
+### 3.2 启动顺序
+
+```text
+QEMU
+  -> _entry (M-mode, satp 尚未使用)
+  -> 为每个 hart 设置 4 KiB 启动栈
+  -> start
+       - satp = 0，使用物理地址
+       - hartid 保存到 tp
+       - PMP 允许 S-mode 访问全部物理地址
+       - mret 切换到 S-mode
+  -> main
+       hart 0: print_init -> pmem_init -> kvm_init -> started = 1
+       其他 hart: 等待 started
+       所有 hart: kvm_inithart -> printf
 ```
-.text : {
-  *(.text .text.*)
-  . = ALIGN(0x1000);
-  /*
-  _trampoline = .;
-  *(trampsec)
-  . = ALIGN(0x1000);
-  ASSERT(. - _trampoline == 0x1000, "error: trampoline larger than one page");
-  */
-  PROVIDE(KERNEL_DATA = .);
-}
+
+`started`前后的`__sync_synchronize()`保证其他 hart 在使用内核页表前能够看到 hart 0 完成的初始化写入。
+
+## 4. 物理内存管理
+
+### 4.1 物理地址与链接布局
+
+QEMU `virt`物理地址空间不只有 RAM，还包含 MMIO：
+
+| 物理地址范围 | 用途 |
+| --- | --- |
+| `0x02000000`起 | CLINT |
+| `0x0c000000`起 | PLIC |
+| `0x10000000`起 | UART |
+| `[0x80000000, 0x88000000)` | 128 MiB RAM |
+
+`kernel.ld`将 RAM 内的内核映像和可分配区域组织为：
+
+```text
+0x80000000 = KERNEL_BASE
+    .text
+KERNEL_DATA                 # .text 结束，4 KiB 对齐
+    .rodata / .data / .bss
+ALLOC_BEGIN                 # 内核映像结束，4 KiB 对齐
+    内核页池：KERN_PAGES * PGSIZE = 1024 * 4 KiB = 4 MiB
+    用户页池：剩余可分配 RAM
+0x88000000 = ALLOC_END
 ```
 
-#### 3.1.2 物理内存分页
+`KERNEL_DATA`和`ALLOC_BEGIN`由链接结果决定，不应写死为固定地址。可通过`riscv64-elf-nm`查看当前值。
 
-##### 物理地址划分
+### 4.2 空闲页链表
 
-物理地址按照地址空间分为三个部分：
-
-- 0x80000000 ~ KERNEL_DATA存放了**kernel-qemu.elf的代码**
-- KERNEL_DATA ~ ALLOC_BEGIN存放了**kernel-qemu.elf的数据**
-- ALLOC_BEGIN ~ ALLOC_END属于**未使用的可分配的物理页**
-
-前两个区域被内核持续占用，不可被动态分配和回收，只有第三部分需要我们管理。
-
-##### 页面管理模式
-
-本内核中对物理内存的管理模式是：**4KB物理页切分 + 空闲链表组织**。
-
-ALLOC_BEGIN ~ ALLOC_END 这块物理空间被切分成若干个4KB内存页（不会有剩余）。
-
-为了实现内核空间与用户空间的隔离，我们设置了两个alloc_regiion，基于KERNEL_PAGE进行边界划分。
-
-`kernel_region`记录了内核空间的空闲物理页情况，`user_region`记录了用户空间的空闲物理页情况，
-
-`alloc_region`描述了一组空闲页链表，包含起止位置、空闲页面数量、链表头节点、保证一致性的锁。
+物理内存按 4 KiB 切分。每个分配区域由以下信息描述：
 
 ```c
-// 物理页节点
-typedef struct page_node
-{
-    struct page_node *next;
-} page_node_t;
-
-// 许多物理页构成一个可分配的区域
 typedef struct alloc_region
 {
-    uint64 begin;          // 起始物理地址
-    uint64 end;            // 终止物理地址
-    spinlock_t lk;         // 自旋锁(保护下面两个变量)
-    uint32 allocable;      // 可分配页面数
-    page_node_t list_head; // 可分配链的链头节点
+    uint64 begin;
+    uint64 end;
+    spinlock_t lk;
+    uint32 allocable;
+    page_node_t list_head;
 } alloc_region_t;
 ```
 
-和用数组管理页表相比，用链表管理空闲物理页可以快速找到空闲页面，无需遍历，提高内存分配速度。
+空闲页不需要额外的元数据数组：页面空闲时，其前 8 bytes 保存下一个空闲页的地址。初始化时链表按物理地址递增；释放采用头插法，因此后续重新分配表现为 LIFO。
 
-下面的图片展示了用链表组织空闲物理内存页的原理：
+两个池的用途如下：
 
-![链表管理物理页示意图](img/img1.jpg)
+- `kern_region`：`ALLOC_BEGIN`后的前 1024 页，用于根页表和中间页表等内核对象。
+- `user_region`：其余 RAM，用于未来的用户页面。
 
-##### 物理内存管理功能实现
+这只是物理页配额划分，不是地址空间访问隔离。当前内核页表仍以 supervisor `R|W`权限恒等映射全部 RAM。
 
-实现`pmem.c`中的`pmem_init()`方法初始化物理内存，其功能是填写`kern_region`和`user_region`的内容，包含数值和链表内容。
+### 4.3 分配器接口
 
-在`src/kernel/mem/type.h`中定义了`KERN_PAGES`宏和`PGSIZE`宏分别表示内核使用可分配空间开头多少个页面，以及页面的大小。
+| 接口 | 契约 |
+| --- | --- |
+| `pmem_init()` | 初始化两个区域、锁、计数和空闲链表；仅由 hart 0 调用一次 |
+| `pmem_alloc(true)` | 从内核池取一页，移出链表并清零；耗尽时 panic |
+| `pmem_alloc(false)` | 从用户池取一页，移出链表并清零；耗尽时 panic |
+| `pmem_free(page)` | 按地址判断所属池并头插回链表；非法区域地址会 panic |
 
-这个链表的构建方法较为特殊。本链表直接使用每个空闲页面的前64位存储next。具体构建方法见后面的代码。
+两个池拥有独立自旋锁，所以同一池内的链表和计数更新是串行的，不同池可以并发操作。页面已经从空闲链表移除后才执行清零，因此清零过程不需要持锁。
 
-`pmem_init()`实现：
+### 4.4 分配器不变量
 
-```c
-// 物理内存的初始化
-// 本质上就是填写kern_region和user_region, 包括基本数值和空闲链表
-void pmem_init(void)
-{
-    // 内核可分配区域：可分配 KERN_PAGES 个页面
-    spinlock_init(&kern_region.lk, "kern_region");
-    kern_region.begin = (uint64)ALLOC_BEGIN;
-    kern_region.end = (uint64)ALLOC_BEGIN + KERN_PAGES * PGSIZE;
-    kern_region.allocable = KERN_PAGES;
-    // 构建链表。本链表利用每个空闲页面的前 64 位存储 next。
-    kern_region.list_head.next = (page_node_t *)kern_region.begin;
-    for (uint64 pg = kern_region.begin; pg < kern_region.end; pg += PGSIZE)
-    {
-        page_node_t* node = (page_node_t*)pg;
-        node->next = (pg + PGSIZE < kern_region.end) ? (page_node_t*)(pg + PGSIZE) : NULL;
-    }
+- `begin`和`end`必须页对齐，区域采用左闭右开区间。
+- `ALLOC_BEGIN + KERN_PAGES * PGSIZE <= ALLOC_END`。
+- 链表中的页面数应等于`allocable`。
+- 已分配页面不能再次分配，已释放页面不能重复释放。
+- 传给`pmem_free`的地址应是分配器返回的页首地址。
 
-    // 用户可分配区域：可分配剩下所有页面
-    spinlock_init(&user_region.lk, "user_region");
-    user_region.begin = kern_region.end;
-    user_region.end = (uint64)ALLOC_END;
-    user_region.allocable = (user_region.end - user_region.begin) / PGSIZE;
-    // 构建链表。和上面相同
-    user_region.list_head.next = (page_node_t*)user_region.begin;
-    for (uint64 pg = user_region.begin; pg < user_region.end; pg += PGSIZE)
-    {
-        page_node_t* node = (page_node_t*)pg;
-        node->next = (pg + PGSIZE < user_region.end) ? (page_node_t*)(pg + PGSIZE) : NULL;
-    }
-}
-```
+后两项目前依赖调用者保证，代码尚未维护位图或引用计数来检测重复释放和非页首地址。
 
-实现`pmem_alloc()`和`pmem_free()`，实现对物理页的分配和释放功能。
+## 5. Sv39 页表基础
 
-##### 测试
+### 5.1 虚拟地址拆分
 
-###### test-1：多核并发申请和释放内核页
-
-该测试由两个 CPU 各申请一半内核物理页，实际申请、写入并释放全部`KERN_PAGES`个页面。参考测试会打印每一个页面，输出较长，因此这里仅打印每个 CPU 获得的首尾地址。
-
-```c
-volatile static int started = 0;
-volatile static int over_1 = 0;
-volatile static int over_2 = 0;
-static int *mem[KERN_PAGES];
-
-static void alloc_kernel_pages(int begin, int end, int cpuid)
-{
-    for (int i = begin; i < end; i++)
-    {
-        mem[i] = pmem_alloc(true);
-        memset(mem[i], 1, PGSIZE);
-        assert(mem[i][0] == 0x01010101, "kernel page write failed");
-    }
-
-    printf("cpu %d pages: first = %p, last = %p\n",
-           cpuid, mem[begin], mem[end - 1]);
-    printf("cpu %d alloc over\n", cpuid);
-}
-
-static void free_kernel_pages(int begin, int end, int cpuid)
-{
-    for (int i = begin; i < end; i++)
-        pmem_free((uint64)mem[i]);
-    printf("cpu %d free over\n", cpuid);
-}
-
-int main()
-{
-    int cpuid = r_tp();
-    int midpoint = KERN_PAGES / 2;
-
-    if (cpuid == 0)
-    {
-        print_init();
-        pmem_init();
-        __sync_synchronize();
-        started = 1;
-
-        alloc_kernel_pages(0, midpoint, cpuid);
-        __sync_synchronize();
-        over_1 = 1;
-        while (over_2 == 0)
-            ;
-        __sync_synchronize();
-        free_kernel_pages(0, midpoint, cpuid);
-    }
-    else
-    {
-        while (started == 0)
-            ;
-        __sync_synchronize();
-
-        alloc_kernel_pages(midpoint, KERN_PAGES, cpuid);
-        __sync_synchronize();
-        over_2 = 1;
-        while (over_1 == 0)
-            ;
-        __sync_synchronize();
-        free_kernel_pages(midpoint, KERN_PAGES, cpuid);
-    }
-
-    while (1)
-        ;
-}
-```
-
-实际输出如下。两个 CPU 并发运行，因此输出顺序和首尾地址在不同运行中可能变化。
+Sv39 使用三级页表，每级索引 9 bits，页内偏移 12 bits：
 
 ```text
-cpu 1 pages: first = 0x0000000080008000, last = 0x000000008029f000
-cpu 1 alloc over
-cpu 0 pages: first = 0x0000000080007000, last = 0x0000000080406000
-cpu 0 alloc over
-cpu 0 free over
-cpu 1 free over
+VA = VPN[2] (9) | VPN[1] (9) | VPN[0] (9) | offset (12)
+       root          middle        leaf          4 KiB page
 ```
 
-两个 CPU 均完成 512 个页面的申请、写入和释放，说明内核物理页空闲链表在并发访问时能够由自旋锁正确保护。由于两个 CPU 交替取得链表头，单个 CPU 获得的页面地址不要求连续。
+每张页表正好占一页，可容纳`4096 / 8 = 512`个 PTE。硬件 Sv39 具有低、高两个 canonical 地址区间；当前实现设置`VA_MAX = 1 << 38`，只接受低半区`[0, 256 GiB)`。
 
-###### test-2：常规用户页操作和内核页耗尽
+当前实现只使用 level-0 的 4 KiB 叶子项，不支持 level-1 的 2 MiB 页或 level-2 的 1 GiB 页。
 
-当前实现的`pmem_free()`会根据地址自动判断页面所属区域，因此测试不再传入`in_kernel`参数。`user_region`是`pmem.c`的私有状态，测试改用公开的内存边界验证用户页地址。
+### 5.2 PTE 状态
 
-```c
-#define TEST_CNT 10
-
-static void test_case_1(void)
-{
-    printf("=== test_case_1: Exhaust Kernel Pages ===\n");
-    for (int i = 0; i <= KERN_PAGES; i++)
-        pmem_alloc(true);
-}
-
-static void test_case_2(void)
-{
-    uint64 user_begin = (uint64)ALLOC_BEGIN + KERN_PAGES * PGSIZE;
-    uint64 user_end = (uint64)ALLOC_END;
-    uint64 user_pages[TEST_CNT];
-    uint64 reallocated[TEST_CNT];
-
-    printf("=== test_case_2: Allocate User Pages ===\n");
-    for (int i = 0; i < TEST_CNT; i++)
-    {
-        user_pages[i] = (uint64)pmem_alloc(false);
-        assert(user_pages[i] >= user_begin && user_pages[i] < user_end,
-               "user page address out of bounds");
-        memset((void *)user_pages[i], 0xAA, PGSIZE);
-    }
-    printf("allocated: first = %p, last = %p\n",
-           user_pages[0], user_pages[TEST_CNT - 1]);
-
-    printf("=== test_case_2: Free User Pages ===\n");
-    for (int i = 0; i < TEST_CNT; i++)
-        pmem_free(user_pages[i]);
-
-    printf("=== test_case_2: Reallocate And Verify Zero ===\n");
-    for (int i = 0; i < TEST_CNT; i++)
-    {
-        reallocated[i] = (uint64)pmem_alloc(false);
-        for (int j = 0; j < PGSIZE; j++)
-            assert(((uint8 *)reallocated[i])[j] == 0,
-                   "reallocated page is not zeroed");
-    }
-    printf("reallocated: first = %p, last = %p\n",
-           reallocated[0], reallocated[TEST_CNT - 1]);
-
-    for (int i = 0; i < TEST_CNT; i++)
-        pmem_free(reallocated[i]);
-    printf("test_case_2 passed!\n");
-}
-
-int main()
-{
-    if (r_tp() == 0)
-    {
-        print_init();
-        pmem_init();
-        test_case_2();
-        test_case_1();
-    }
-
-    while (1)
-        ;
-}
-```
-
-实际输出如下：
+PTE 低位格式为：
 
 ```text
-=== test_case_2: Allocate User Pages ===
-allocated: first = 0x0000000080405000, last = 0x000000008040e000
-=== test_case_2: Free User Pages ===
-=== test_case_2: Reallocate And Verify Zero ===
-reallocated: first = 0x000000008040e000, last = 0x0000000080405000
-test_case_2 passed!
-=== test_case_1: Exhaust Kernel Pages ===
-panic! pmem_alloc() failed: no available physical pages in kernel region.
+RSW | D A G U X W R V
 ```
 
-重新申请得到相反的首尾地址，符合空闲页头插法形成的 LIFO 顺序；逐字节检查确认`pmem_alloc()`重新分配页面时进行了清零。`test_case_1`在第 1025 次内核页申请时触发 panic，这是内核页池耗尽后的预期行为。由于 panic 不返回，耗尽测试应放在其他可继续执行的测试之后，或单独运行。
+| 条件 | 含义 |
+| --- | --- |
+| `V = 0` | 无效 PTE，其余位不参与地址翻译 |
+| `V = 1`且`R/W/X = 0` | 非叶子 PTE，PPN 指向下一级页表 |
+| `V = 1`且`R = 1`或`X = 1` | 合法叶子 PTE，PPN 指向物理页 |
+| `V = 1`、`R = 0`且`W = 1` | RISC-V 保留的非法组合 |
 
-#### 3.1.3 上一节实现过程中遇到的问题
+常用转换：
 
-运行第一组测试用例的时候，在释放已分配的块的时候出现了`panic: spinlock_acquire`错误。调试发现，
-
-GDB调试信息：
-
+```c
+vpn = VA_TO_VPN(va, level);
+pte = PA_TO_PTE(pa) | flags;
+pa = PTE_TO_PA(pte);
+flags = PTE_FLAGS(pte);
 ```
+
+`PTE_CHECK(pte)`只检查`R/W/X`是否全零；必须先确认`PTE_V`，才能把结果解释为有效的非叶子项。RISC-V 将`W=1、R=0`保留为非法组合，实际映射应避免只设置`PTE_W`。
+
+## 6. 页表操作
+
+### 6.1 `vm_getpte`
+
+从 level 2 开始，根据 VPN 逐级下降并返回 level-0 PTE 的地址：
+
+- `alloc=false`：中间页表不存在时返回`NULL`。
+- `alloc=true`：从内核页池分配清零页面，并写入`PA_TO_PTE(page) | PTE_V`。
+- 遇到高层叶子项会触发断言，因为本实现不支持大页。
+- `va >= VA_MAX`时 panic。
+
+代码将 PTE 中的 PA 直接转换为可解引用指针。这在分页前依赖 Bare 模式，在分页后依赖内核对 RAM 的恒等映射。
+
+### 6.2 `vm_mappages`
+
+建立`[va, va + len)`到物理页的连续映射：
+
+- `va`和`pa`必须页对齐，`len > 0`。
+- `len`是字节数；末尾不足一页时仍映射完整页面。
+- 范围不得超过`VA_MAX`，检查使用减法避免`va + len`溢出。
+- 目标 PTE 已有效时触发重映射断言。
+- 函数补充`PTE_V`，调用者提供`R/W/X/U`等权限。
+- 函数本身不刷新 TLB，活动页表的调用者必须显式处理。
+
+### 6.3 `vm_unmappages`
+
+逐页清除`[va, va + len)`中的叶子 PTE：
+
+- 区间中的每个页面都必须已经映射。
+- `freeit=true`时同时将叶子物理页交还给物理分配器。
+- 不会回收空的中间页表，也不会释放根页表。
+- 不会刷新 TLB。
+
+同一物理页存在多个映射时不能随意使用`freeit=true`，否则其他别名会指向已经释放并可能被复用的页面。
+
+### 6.4 `vm_print`
+
+递归打印有效的三级页表项，用于检查 VPN、PA 和 flags。它假定高两级只有非叶子项、level 0 只有叶子项。完整打印内核直接映射会产生大量输出，通常只应用于小型测试页表。
+
+### 6.5 与 xv6 接口的差异
+
+参考 xv6 代码时不能直接复制调用参数：
+
+| 操作 | 本项目 | xv6-riscv |
+| --- | --- | --- |
+| 映射 | `vm_mappages(pgtbl, va, pa, len, perm)` | `mappages(pagetable, va, size, pa, perm)` |
+| 解映射 | `vm_unmappages(pgtbl, va, len, freeit)`，`len`为 bytes | `uvmunmap(pagetable, va, npages, do_free)`，单位为页 |
+| 物理页分配 | `pmem_alloc(in_kernel)`，耗尽时 panic | `kalloc()`，失败时返回`0` |
+
+本项目的`va`和`pa`必须页对齐，但`len`允许不是页大小的整数倍。
+
+## 7. 内核页表
+
+### 7.1 恒等映射
+
+`kvm_init()`先从内核池分配根页表，再建立 VA 等于 PA 的映射：
+
+| 虚拟地址范围 | 物理地址范围 | 权限 | 用途 |
+| --- | --- | --- | --- |
+| `[UART_BASE, UART_BASE + 0x1000)` | 相同 | `R|W` | UART 寄存器 |
+| `[CLINT_BASE, CLINT_BASE + 0x10000)` | 相同 | `R|W` | CLINT 寄存器 |
+| `[PLIC_BASE, PLIC_BASE + 0x400000)` | 相同 | `R|W` | PLIC 寄存器 |
+| `[KERNEL_BASE, KERNEL_DATA)` | 相同 | `R|X` | 内核 `.text` |
+| `[KERNEL_DATA, ALLOC_BEGIN)` | 相同 | `R|W` | `.rodata/.data/.bss` |
+| `[ALLOC_BEGIN, ALLOC_END)` | 相同 | `R|W` | 全部可分配 RAM |
+
+当前映射全部使用 4 KiB 叶子页。页表开销为 1 个根页、MMIO 的 1 个 level-1 页与 4 个 level-0 页、RAM 的 1 个 level-1 页与 64 个 level-0 页，共 71 个内核页。因此`kvm_init()`后内核池剩余 953 页。
+
+`.rodata`当前位于`KERNEL_DATA`之后，所以也被映射为可写；若后续需要更严格的 W^X/只读数据保护，应在链接脚本中额外导出边界并拆分映射。
+
+所有内核映射都不设置`PTE_U`。代码也没有预置`PTE_A/PTE_D`，当前运行依赖 QEMU 在访问页面时更新这些位。
+
+### 7.2 启用分页
+
+每个 hart 都执行：
+
+```c
+w_satp(MAKE_SATP(kernel_pgtbl));
+sfence_vma();
+```
+
+`MAKE_SATP`设置 MODE=Sv39、ASID=0，并填入根页表 PPN。`sfence.vma`刷新当前 hart 的全部 TLB 项。共享页表在启用前已由 hart 0 完成构建，因此启动阶段不需要 TLB shootdown。
+
+运行期间若修改活动页表，调用者必须负责本地`sfence.vma`；多 hart 共享页表还需要实现跨 hart TLB shootdown。
+
+## 8. 验证记录
+
+当前`main()`只执行初始化和双 hart 启动 smoke test。功能测试曾通过临时替换`main()`执行；完整代码、实际输出、运行方式和覆盖缺口见[`TESTING.md`](TESTING.md)。
+
+| 测试 | 核心检查 | 结果 |
+| --- | --- | --- |
+| 内核页并发分配 | 两个 hart 各申请、写入、释放 512 页 | 通过，无锁错误 |
+| 用户页分配/释放 | 地址属于用户池；释放后重新分配并逐字节检查清零 | 通过，重新分配顺序符合 LIFO |
+| 内核池耗尽 | 第 1025 次内核页申请 | 按预期 panic |
+| 跨层级页表映射 | 覆盖不同 VPN[2:0]和不足一页的长度 | PTE 地址、PA 和 flags 符合预期 |
+| 映射与解映射断言 | 两组独立 PA 的映射、权限、清除和释放 | 输出`test_mapping_and_unmapping passed!` |
+| 重复映射 | 对有效 PTE 再次调用`vm_mappages` | 按预期触发 remapping 断言 |
+
+## 9. 已知限制与后续工作
+
+### 9.1 内存模块
+
+- `pmem_free`不检查页对齐、重复释放或页面当前是否已分配。
+- 页表操作没有内部锁；共享页表的修改必须由调用者串行化。
+- `vm_mappages`不验证`perm`是否合法，也不屏蔽意外的高位。
+- 没有页表引用计数、递归销毁和中间页表回收。
+- 修改活动页表后没有自动 TLB 刷新或跨 hart shootdown。
+- 尚无用户页表、`PTE_U`映射、用户/内核地址空间隔离和 guard page。
+- 所有不可恢复错误统一 panic，没有向上返回 OOM 或部分映射失败。
+
+### 9.2 启动与构建
+
+- 每个 hart 的启动栈只有 4 KiB，连续排列且没有 guard page。
+- 启动代码依赖 ELF 加载器清零 `.bss`。
+- `Makefile`会生成`.d`依赖文件但没有包含它们，头文件或`kernel.ld`变化后建议执行`make clean && make build`。
+- `debug`目标当前依赖未定义的`$(KERN)`，从干净目录使用前需要修正依赖关系。
+
+建议的后续实现顺序：
+
+1. 为`pmem_free`增加页对齐和重复释放检查。
+2. 实现用户页表创建、`walkaddr`、页表递归释放和用户内存复制。
+3. 增加 trap/trampoline、页错误诊断和用户态切换。
+4. 为活动共享页表实现本地 TLB 刷新与跨 hart shootdown。
+5. 将阶段性测试迁移到独立测试文件和 Makefile test target。
+
+## 10. 历史问题：自旋锁持有者标记
+
+运行第一组测试用例时，在释放已分配的页面时出现了`panic: spinlock_acquire`错误。
+
+GDB 调试信息如下。地址及`pmem_free(page, in_kernel)`签名来自问题发生时的旧版本：
+
+```text
 (gdb) b src/kernel/lock/spinlock.c:56
 Breakpoint 1 at 0x80000818: file src/kernel/lock/spinlock.c, line 56.
 (gdb) c
@@ -399,371 +359,50 @@ $1 = 0x800011d8 "kern_region"
 #2  0x00000000800001dc in main () at src/kernel/main.c:32
 ```
 
-研究后发现，问题出在spinlock的实现中存在竞争问题，`spinlock_t.locked`在锁没有被占用和被CPU0占用时均取值为0，在并发执行时，`spinlock_acquire()`函数中的`spinlock_holding()`调用会错误地判断本核心已持有锁，产生报错。
+研究后发现，问题出在 spinlock 实现中的竞争窗口。早期代码用`cpuid=0`表示无人持有锁，但 0 同时也是 CPU 0 的合法 hart ID。在并发执行时，`spinlock_acquire()`中的`spinlock_holding()`可能错误地判断 CPU 0 已持有锁并触发 panic。
 
 出错时的具体操作序列：
 
-```
-CPU1: 进入spinlock_release(&lk);
+```text
+CPU1: 进入 spinlock_release(&lk);
 CPU1: lk->cpuid = 0; // 清零 cpuid
-CPU0: 进入spinlock_acquire(&lk);
-CPU0: 进入spinlock_holding(&lk);
+CPU0: 进入 spinlock_acquire(&lk);
+CPU0: 进入 spinlock_holding(&lk);
 CPU0: r = (lk->locked && lk->cpuid == mycpuid());
 // 此时 lk->locked == 1，lk->cpuid == 0，函数认为锁被 CPU0 持有，触发 panic
 // 但实际上锁被 CPU1 持有（正在释放），出现了误判
 ```
 
-要解决这个bug，就要避免清零cpuid后被误判成CPU0持有锁，方法是让特殊值-1代表无人持有锁，释放锁的时候执行`lk->cpuid = -1;`，`spinlock_holding()`不会出现误判。此外，自旋锁初始化函数`spinlock_init`中也一致地将`lk->cpuid`设为-1。
-
-### 3.2 内核态虚拟内存
-
-由于应用程序要求能独占整个地址空间，并且各个程序持有的内存需要有记录，因此需要有虚拟内存管理。
-
-实现基于内核态的虚拟内存管理，使用三级页表管理。
-
-#### 3.2.1 内核态虚拟内存：页表+页表项
-
-在RIST-V体系结构中，要建立页表并通过MMU自动完成翻译，需要遵循SV39规范，即39bit虚拟地址的虚拟内存，该规范在`src/kernel/mem/type.h`的注释中介绍。
-
-```c
-/*
-    内核使用RISC-V体系结构中的SV39作为虚拟内存的设计规范
-
-    1. 页表与satp寄存器
-    
-    satp寄存器的bit结构: MODE(4bit) + ASID(16bit) + PPN(44bit)
-    - MODE控制虚拟内存模式
-    - ASID与Flash刷新有关
-    - PPN存放页表基地址
-    可以通过w_satp(MAKE_SATP(pgtbl))命令将页表地址填入satp寄存器并启动地址翻译
-    在无页表到有页表 + 切换页表的情况下会用到
-
-    2. SV39的虚拟地址与三级映射表
-
-    物理页是最基本的内存资源, 有的物理页用于存放数据, 有的物理页用于存放描述"物理页映射关系"的页表
-    VA: VPN[2] + VPN[1] + VPN[0] + offset
-          9    +   9    +   9    +   12    = 39 (使用uint64存储) => 最大虚拟地址为512GB
-    SV39使用三级页表对应三级VPN, VPN[2]称为顶级页表、VPN[1]称为次级页表、VPN[0]称为低级页表
-    为什么每一级页框号是"9": 4KB/sizeof(PTE) = 512 = 2^9 所以一个物理页可以存放512个页表项
-    生活中的例子: 假设你要在全国范围内找一个不认识的大学老师, 
-    - 你可以先到教育部(顶级页表)查询, 得知这个老师属于大学A
-    - 你接着来到大学A(次级页表)查询, 得知这个老师属于学院B
-    - 你最后来到学院B(低级页表)查询, 得知这个老师属于办公室C
-    - 最后你来到办公室C(物理页), 并在某个位置(offset)上找到了他
-
-    3. 页表的基本组成单位-页表项(PTE)
-    reserved + PPN[2] + PPN[1] + PPN[0] + RSW + D A G U X W R V  共64bit
-       10        26       9        9       2    1 1 1 1 1 1 1 1
-    需要关注的部分:
-    - V : valid
-    - X W R : execute write read (全0意味着这是页表所在的物理页)
-    - U : 用户态是否可以访问
-    - PPN区域 : 存放物理页号
-
-*/
-```
-
-页表（pgtbl）由页表项（PTE）构成，一个页表项对应一个物理页，页表项主要由两部分组成：
-
-- 它所管理的物理页的页号（PPN字段）
-- 它所管理的物理页的标志位（低10bit）
-
-页表本身也是存放在物理页中，这种物理页的特点是PTE的标志位中PTR_R PTE_W PTE_X都是0（不可读不可写不可执行）
-
-下图显示了页表的示意图和实际状态：
-
-![页表示意图](img/img2.jpg)
-
-页表刚初始化的时候只是一个清空的4KB物理页， 随着mmap操作的增加，页表开始延伸出去，直到完全长成一个能管理512GB内存空间的树。
-
-页表的三级组织结构：
-
-- 顶级页表的PTE中有次级页表所在的物理页的物理页号和标志位
-- 次级页表的PTE中有低级页表所在的物理页的物理页号和标志位
-- 低级页表的PTE中有一般物理页的物理页号和标志位
-
-##### 实现虚拟内存管理
-
-需要依次实现`vm_getpte`、`vm_mappages`、`vm_unmappages`三个函数。
-
-为了方便理解，可以将“三级页表”理解成一个3层的512叉树：
-
-```plaintext
-root(level2)
-	|
-	VPN2
-	|
-level1 table
-	|
-	VPN1
-	|
-level0 table
-	|
-	VPN0
-	|
-leaf PTE -> physical page
-```
-
-每一级页表都是：
-
-```c
-pte_t pgtbl[512];
-```
-
-一个PTE有两种身份：
-
-1. 中间结点（指向下一级页表）
-
-```c
-pte = PA_TO_PTE(next_pgtbl) | PTE_V;
-```
-
-注意：`R=W=X=0`。
-
-所以：
-
-```c
-PTE_CHECK(pte);
-```
-
-返回true。
-
-2. 叶子节点（指向真正的数据页）
-
-```c
-pte = PA_TO_PTE(pa) | PTE_V | PTE_R 或 PTE_W 或 PTE_X;
-```
-
-至少有一个`R/W/X`被置位。
-
-所以：
-
-```c
-PTE_CHECK(pte);
-```
-
-返回false。
-
-###### vm_getpte 在干什么
-
-假设`va = 0x0000000123456789`，它会被拆成：
-
-```
-VPN2 + VPN1 + VPN0 + offset
- 9   +  9   +  9   +   12  = 39bit
-```
-
-然后执行以下查询流程：
-
-```
-pgtbl
- |
-pgtbl[VPN2]
- |
- 下一级页表
- |
-pgtbl[VPN1]
- |
- 下一级页表
- |
-pgtbl[VPN0]
-```
-
-最后返回`&pgtbl[VPN0]`，类型是`pte_t *`。
-
-调用者就可以：
-
-```
-*pte = PA_TO_PTE(pa) | flags;
-```
-
-建立映射。
-
-TPE的结构：
-
-```
-reserved + PPN2 + PPN1 + PPN0 + RSW + D A G U X W R V
-  10     +  26  +  9   +  9   +  2  + 1 1 1 1 1 1 1 1 共 64bit
-需要关注的部分：
-V: valid
-X W R: execute write read（若全 0 代表这是页表所在的物理页）
-U: 用户态是否可以访问
-PPN 区域: 存放物理页号
-```
-
-#### 3.2.2 页表映射与解映射测试
-
-测试代码如下。CPU 0 创建测试页表并建立五组映射，随后解除其中两组映射；两个 CPU 最后分别启用内核页表。
-
-```c
-volatile static int started = 0;
-
-int main()
-{
-    int cpuid = r_tp();
-    if (cpuid == 0)
-    {
-        print_init();
-        pmem_init();
-        kvm_init();
-
-        __sync_synchronize();
-        started = 1;
-
-        pgtbl_t test_pgtbl = pmem_alloc(true);
-        uint64 mem[5];
-        for (int i = 0; i < 5; i++)
-            mem[i] = (uint64)pmem_alloc(false);
-
-        printf("\ntest-1\n\n");
-        vm_mappages(test_pgtbl, 0, mem[0], PGSIZE, PTE_R);
-        vm_mappages(test_pgtbl, PGSIZE * 10, mem[1], PGSIZE / 2,
-                    PTE_R | PTE_W);
-        vm_mappages(test_pgtbl, PGSIZE * 512, mem[2], PGSIZE - 1,
-                    PTE_R | PTE_X);
-        vm_mappages(test_pgtbl, PGSIZE * 512 * 512, mem[2], PGSIZE,
-                    PTE_R | PTE_X);
-        vm_mappages(test_pgtbl, VA_MAX - PGSIZE, mem[4], PGSIZE, PTE_W);
-        vm_print(test_pgtbl);
-
-        printf("\ntest-2\n\n");
-        vm_unmappages(test_pgtbl, PGSIZE * 10, PGSIZE, true);
-        vm_unmappages(test_pgtbl, PGSIZE * 512, PGSIZE, true);
-        vm_print(test_pgtbl);
-    }
-    else
-    {
-        while (started == 0)
-            ;
-        __sync_synchronize();
-    }
-
-    kvm_inithart();
-    printf("cpu %d is booting!\n", cpuid);
-
-    while (1)
-        ;
-}
-```
-
-运行输出如下：
-
-```text
-test-1
-
-cpu 1 is booting!
-level-2 pgtbl: pa = 0x000000008004b000
-.. level-1 pgtbl 0: pa = 0x000000008004c000
-.. .. level-0 pgtbl 0: pa = 0x000000008004d000
-.. .. .. physical page 0: pa = 0x0000000080404000 flags = 3
-.. .. .. physical page 10: pa = 0x0000000080405000 flags = 7
-.. .. level-0 pgtbl 1: pa = 0x000000008004e000
-.. .. .. physical page 0: pa = 0x0000000080406000 flags = 11
-.. level-1 pgtbl 1: pa = 0x000000008004f000
-.. .. level-0 pgtbl 0: pa = 0x0000000080050000
-.. .. .. physical page 0: pa = 0x0000000080406000 flags = 11
-.. level-1 pgtbl 255: pa = 0x0000000080051000
-.. .. level-0 pgtbl 511: pa = 0x0000000080052000
-.. .. .. physical page 511: pa = 0x0000000080408000 flags = 5
-
-test-2
-
-level-2 pgtbl: pa = 0x000000008004b000
-.. level-1 pgtbl 0: pa = 0x000000008004c000
-.. .. level-0 pgtbl 0: pa = 0x000000008004d000
-.. .. .. physical page 0: pa = 0x0000000080404000 flags = 3
-.. .. level-0 pgtbl 1: pa = 0x000000008004e000
-.. level-1 pgtbl 1: pa = 0x000000008004f000
-.. .. level-0 pgtbl 0: pa = 0x0000000080050000
-.. .. .. physical page 0: pa = 0x0000000080406000 flags = 11
-.. level-1 pgtbl 255: pa = 0x0000000080051000
-.. .. level-0 pgtbl 511: pa = 0x0000000080052000
-.. .. .. physical page 511: pa = 0x0000000080408000 flags = 5
-cpu 0 is booting!
-```
-
-`test-1`说明长度不足一页的区域仍会占用一个完整页表映射，并验证了跨越不同 VPN 层级时能够按需创建中间页表。同一个物理页`0x80406000`被映射到两个虚拟地址，这是测试代码复用`mem[2]`的预期结果。
-
-PTE 标志值`3`、`7`、`11`和`5`分别表示`V|R`、`V|R|W`、`V|R|X`和`V|W`。其中`V|W`仅用于观察标志位；RISC-V 将`W=1、R=0`规定为保留组合，不应作为实际可访问映射。
-
-`test-2`解除虚拟页 10 和虚拟地址`PGSIZE * 512`的叶子映射，因此对应的 physical page 行消失。`vm_unmappages`不会回收中间页表，所以空的 level-0 页表仍会显示。两个 CPU 并发运行，`cpu 1 is booting!`的位置可能在不同运行中发生变化；页表和物理页地址也可能随内核布局及分配顺序改变。
-
-#### 3.2.3 映射与解映射断言测试
-
-第二个虚拟内存测试直接查询 PTE，验证虚拟地址、物理地址和权限位的映射结果，然后解除映射并确认`PTE_V`已清除。参考代码中的`*pte & PTE_R == PTE_R`存在运算符优先级问题，这里改为`(*pte & PTE_R) == PTE_R`。
-
-```c
-void test_mapping_and_unmapping(void)
-{
-    pte_t *pte;
-    pgtbl_t pgtbl = (pgtbl_t)pmem_alloc(true);
-    memset(pgtbl, 0, PGSIZE);
-
-    uint64 va_1 = 0x100000;
-    uint64 va_2 = 0x8000;
-    uint64 pa_1 = (uint64)pmem_alloc(false);
-    uint64 pa_2 = (uint64)pmem_alloc(false);
-
-    vm_mappages(pgtbl, va_1, pa_1, PGSIZE, PTE_R | PTE_W);
-    vm_mappages(pgtbl, va_2, pa_2, PGSIZE, PTE_R);
-
-    pte = vm_getpte(pgtbl, va_1, false);
-    assert(pte != NULL, "test_mapping_and_unmapping: pte_1 not found");
-    assert((*pte & PTE_V) != 0,
-           "test_mapping_and_unmapping: pte_1 not valid");
-    assert(PTE_TO_PA(*pte) == pa_1,
-           "test_mapping_and_unmapping: pa_1 mismatch");
-    assert((*pte & (PTE_R | PTE_W)) == (PTE_R | PTE_W),
-           "test_mapping_and_unmapping: flag_1 mismatch");
-
-    pte = vm_getpte(pgtbl, va_2, false);
-    assert(pte != NULL, "test_mapping_and_unmapping: pte_2 not found");
-    assert((*pte & PTE_V) != 0,
-           "test_mapping_and_unmapping: pte_2 not valid");
-    assert(PTE_TO_PA(*pte) == pa_2,
-           "test_mapping_and_unmapping: pa_2 mismatch");
-    assert((*pte & PTE_R) == PTE_R,
-           "test_mapping_and_unmapping: flag_2 mismatch");
-
-    vm_unmappages(pgtbl, va_1, PGSIZE, true);
-    vm_unmappages(pgtbl, va_2, PGSIZE, true);
-
-    pte = vm_getpte(pgtbl, va_1, false);
-    assert(pte != NULL, "test_mapping_and_unmapping: pte_1 not found");
-    assert((*pte & PTE_V) == 0,
-           "test_mapping_and_unmapping: pte_1 still valid");
-
-    pte = vm_getpte(pgtbl, va_2, false);
-    assert(pte != NULL, "test_mapping_and_unmapping: pte_2 not found");
-    assert((*pte & PTE_V) == 0,
-           "test_mapping_and_unmapping: pte_2 still valid");
-
-    printf("test_mapping_and_unmapping passed!\n");
-}
-```
-
-两个 CPU 完成内核页表切换后，只由 CPU 0 调用测试：
-
-```c
-kvm_inithart();
-
-if (cpuid == 0)
-{
-    printf("\ntest_mapping_and_unmapping\n\n");
-    test_mapping_and_unmapping();
-}
-
-printf("cpu %d is booting!\n", cpuid);
-```
-
-实际输出如下：
-
-```text
-test_mapping_and_unmapping
-
-cpu 1 is booting!
-test_mapping_and_unmapping passed!
-cpu 0 is booting!
-```
-
-测试顺利输出`passed`，说明两组映射的 PTE 地址、物理页号、权限位及解映射结果均符合预期。CPU 1 的启动信息可能与测试输出交错，这是两个 CPU 并发执行造成的正常现象。
+该序列发生在 CPU 1 已清除`cpuid`、但尚未通过`__sync_lock_release`清除`locked`的窗口内。此时 CPU 0 看到`locked == 1 && cpuid == 0`，因而把 CPU 1 正在释放的锁误认为由自己持有。
+
+要解决这个问题，需要避免“无人持有”和“CPU 0 持有”使用相同的`cpuid`。当前修复使用特殊值`-1`表示无人持有：`spinlock_init()`初始化时将`lk->cpuid`设为`-1`，`spinlock_release()`释放时也写入`-1`。这样`spinlock_holding()`不会再把释放窗口误判为 CPU 0 已持锁。并发申请、释放全部内核页的测试验证了该修复。
+
+## 11. 速查
+
+### 11.1 核心常量
+
+| 常量 | 含义 |
+| --- | --- |
+| `KERNEL_BASE` | RAM 和内核加载基址，`0x80000000` |
+| `ALLOC_END` | 内核使用的 RAM 末端，`0x88000000` |
+| `PGSIZE` | 4 KiB |
+| `KERN_PAGES` | 内核池 1024 页，即 4 MiB |
+| `VA_MAX` | 当前实现允许的 VA 上界，`1 << 38` |
+| `SATP_SV39` | `satp.MODE = 8` |
+
+### 11.2 关键约束
+
+- 页表页和叶子 PA 必须 4 KiB 对齐。
+- 高两级有效 PTE 必须是非叶子项。
+- 叶子权限应满足 RISC-V PTE 编码要求，尤其避免`W=1、R=0`。
+- 释放叶子物理页前必须确认不存在其他映射或引用。
+- 修改活动页表后必须处理 TLB 一致性。
+- 修改 RAM 大小、hart 数量或链接边界时，应同时检查 Makefile、架构常量和页表映射。
+
+### 11.3 参考位置
+
+- 本项目内存接口：`src/kernel/mem/method.h`
+- 本项目页表宏：`src/kernel/mem/type.h`
+- xv6 页表实现：`../xv6-labs-2020/kernel/vm.c`
+- xv6 平台地址：`../xv6-labs-2020/kernel/memlayout.h`
+- 架构规范：RISC-V Privileged Architecture 中的 `satp`、Sv39、PTE 和 `SFENCE.VMA`章节
