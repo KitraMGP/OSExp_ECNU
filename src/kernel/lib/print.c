@@ -15,7 +15,7 @@ void print_init(void)
     spinlock_init(&print_lk, "printf");
 }
 
-/* %d %p */
+/* %d %x */
 static void printint(int xx, int base, int sign)
 {
     char buf[16];
@@ -40,7 +40,7 @@ static void printint(int xx, int base, int sign)
         uart_putc_sync(buf[i]);
 }
 
-/* %x */
+/* %p */
 static void printptr(uint64 x)
 {
     uart_putc_sync('0');
@@ -52,8 +52,8 @@ static void printptr(uint64 x)
 /*
     标准化输出, 支持:
     1. %d (32位有符号数,以10进制输出)
-    2. %p (32位无符号数,以16进制输出)
-    3. %x (64位无符号数,以0x开头的16进制输出)
+    2. %x (32位无符号数,以16进制输出)
+    3. %p (64位无符号数,以0x开头的16进制输出)
     4. %c (单个字符)
     5. %s (字符串)
 */
