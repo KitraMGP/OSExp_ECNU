@@ -80,7 +80,7 @@ void trap_kernel_handler()
     assert(sstatus & SSTATUS_SPP, "trap_kernel_handler: not from s-mode");
     assert(intr_get() == 0, "trap_kernel_handler: interreput enabled");
 
-    int trap_id = scause & 0xf;
+    uint64 trap_id = scause & 0x7ffffffffffffffful;
 
     /* 高位bit标识了是中断还是异常 */
     if (scause & 0x8000000000000000ul)
@@ -95,8 +95,9 @@ void trap_kernel_handler()
             external_interrupt_handler();
             break;
         default: // 例外处理
-            printf("\nunexpected interrupt: %s\n", interrupt_info[trap_id]);
-            printf("trap_id = %d, sepc = %p, stval = %p\n", trap_id, sepc, stval);
+            char *info = trap_id < 16 ? interrupt_info[trap_id] : "unknown interrupt";
+            printf("\nunexpected interrupt: %s\n", info);
+            printf("trap_id = %p, sepc = %p, stval = %p\n", trap_id, sepc, stval);
             panic("trap_kernel_handler");
         }
     }
@@ -107,8 +108,9 @@ void trap_kernel_handler()
         {
 
         default: // 例外处理
-            printf("\nunexpected exception: %s\n", exception_info[trap_id]);
-            printf("trap_id = %d, sepc = %p, stval = %p\n", trap_id, sepc, stval);
+            char *info = trap_id < 16 ? exception_info[trap_id] : "unknown exception";
+            printf("\nunexpected exception: %s\n", info);
+            printf("trap_id = %p, sepc = %p, stval = %p\n", trap_id, sepc, stval);
             panic("trap_kernel_handler");
         }
     }

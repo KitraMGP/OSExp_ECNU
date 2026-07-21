@@ -45,8 +45,8 @@ void uart_init(void)
 	// 清零和使能FIFO模式
 	WriteReg(FCR, FCR_FIFO_ENABLE | FCR_FIFO_CLEAR);
 
-	// 使能输出队列和接收队列的中断
-	WriteReg(IER, IER_TX_ENABLE | IER_RX_ENABLE);
+	// 当前驱动同步发送字符，只需要通过中断处理接收队列。
+	WriteReg(IER, IER_RX_ENABLE);
 }
 
 // 单个字符输出

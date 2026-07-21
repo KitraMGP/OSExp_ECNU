@@ -1,5 +1,8 @@
 #include "mod.h"
 
+// in trap/trampoline.S
+extern char trampoline[];
+
 // 内核页表
 static pgtbl_t kernel_pgtbl;
 
@@ -135,6 +138,15 @@ void kvm_init()
                 (uint64)ALLOC_BEGIN, (uint64)ALLOC_BEGIN,
                 (uint64)ALLOC_END - (uint64)ALLOC_BEGIN,
                 PTE_R | PTE_W);
+
+    // trampoline在内核页表和用户页表中必须使用相同的虚拟地址。
+    vm_mappages(kernel_pgtbl, TRAMPOLINE, (uint64)trampoline,
+                PGSIZE, PTE_R | PTE_X);
+
+    // 内核栈使用内核物理页，并与相邻内核栈之间保留未映射的保护页。
+    uint64 kstack_page = (uint64)pmem_alloc(true);
+    vm_mappages(kernel_pgtbl, KSTACK(0), kstack_page,
+                PGSIZE, PTE_R | PTE_W);
 }
 
 // 每个CPU都需要调用, 从不使用页表切换到使用内核页表

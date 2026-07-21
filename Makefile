@@ -13,7 +13,7 @@ KERNEL_LD  = kernel.ld
 # 定义内核目标文件路径
 ELFKernel = $(TARGET)/kernel/kernel-qemu.elf
 NakedKernel = $(TARGET)/kernel/kernel-qemu.bin
-ELFUser = $(TARGET)/user/initcode.h
+ELFUser = $(UserPath)/initcode.h
 
 # 收集内核代码文件和用户代码文件(.c .S)
 KernelSourceFile = $(wildcard $(KernelPath)/*.c) $(wildcard $(KernelPath)/*.S)
@@ -24,6 +24,8 @@ UserSourceFile = $(wildcard $(UserPath)/*.c)
 KernelOBJ = $(patsubst $(KernelPath)/%.S, $(TARGET)/kernel/%.o, $(filter %.S, $(KernelSourceFile)))
 KernelOBJ += $(patsubst $(KernelPath)/%.c, $(TARGET)/kernel/%.o, $(filter %.c, $(KernelSourceFile)))
 UserOBJ = $(patsubst $(UserPath)/%.c, $(TARGET)/user/%.o, $(filter %.c, $(UserSourceFile)))
+
+-include $(KernelOBJ:.o=.d) $(UserOBJ:.o=.d)
 
 # QEMU模拟器配置
 QEMU     = qemu-system-riscv64  # 指定QEMU程序
@@ -44,7 +46,6 @@ QEMUGDB = $(shell if $(QEMU) -help | grep -q '^-gdb'; \
 # 创建输出目录结构（如果不存在）
 .PHONY: $(TARGET)
 $(TARGET):
-ifeq ($(wildcard $(TARGET)),)
 	@mkdir -p $(TARGET)/kernel
 	@mkdir -p $(TARGET)/kernel/arch
 	@mkdir -p $(TARGET)/kernel/boot
@@ -54,26 +55,28 @@ ifeq ($(wildcard $(TARGET)),)
 	@mkdir -p $(TARGET)/kernel/trap
 	@mkdir -p $(TARGET)/kernel/proc
 	@mkdir -p $(TARGET)/user
-endif
 
 # 编译规则：将汇编文件(.S)编译为目标文件(.o)
-$(TARGET)/kernel/%.o: $(KernelPath)/%.S
+$(TARGET)/kernel/%.o: $(KernelPath)/%.S | $(TARGET)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # 编译规则：将C文件(.c)编译为目标文件(.o)
-$(TARGET)/kernel/%.o: $(KernelPath)/%.c
+$(TARGET)/kernel/%.o: $(KernelPath)/%.c | $(TARGET)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # 编译规则：将C文件(.c)编译为目标文件(.o)
-$(TARGET)/user/%.o: $(UserPath)/%.c
+$(TARGET)/user/%.o: $(UserPath)/%.c | $(TARGET)
 	$(CC) $(CFLAGS) -march=rv64g -nostdinc -c -o $@ $<
 
+# proc.c直接包含生成的initcode.h，并行构建时必须等待用户程序完成转换。
+$(TARGET)/kernel/proc/proc.o: $(ELFUser)
+
 # 链接生成内核ELF文件
-$(ELFKernel): $(KernelOBJ)
+$(ELFKernel): $(KernelOBJ) | $(TARGET)
 	$(LD) $(LDFLAGS) -T $(KERNEL_LD) $^ -o $@
 
 # 生成initcode.h
-$(ELFUser): $(UserOBJ)
+$(ELFUser): $(UserOBJ) | $(TARGET)
 	$(LD) $(LDFLAGS) -N -e main -Ttext 0 -o $(TARGET)/user/initcode.out $(TARGET)/user/initcode.o
 	$(OBJCOPY) -S -O binary $(TARGET)/user/initcode.out $(TARGET)/user/initcode
 	xxd -i $(TARGET)/user/initcode > $(UserPath)/initcode.h

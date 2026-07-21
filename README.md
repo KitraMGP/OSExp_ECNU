@@ -76,6 +76,10 @@ OSExp_ECNU
 - `TRAMPOLINE`：映射 `trampoline.S` 的代码页。
 - `KSTACK(0)`：映射 `proczero` 的内核栈。
 
+![用户页表与内核页表的地址空间布局](./pictures/03.png)
+
+图中两侧的 trampoline 通过不同页表映射到相同虚拟地址；内核栈上方保留未映射的间隔页，用于阻止栈溢出越过进程边界。用户栈从高地址向下增长，用户堆则从代码和数据区域上方向高地址增长。
+
 `trampoline` 必须在用户页表和内核页表中位于相同虚拟地址。切换 `satp` 的过程中，处理器才能继续执行这段代码，而不会因地址含义变化失去下一条指令。
 
 ### 3. 用户程序如何进入内核镜像
@@ -159,7 +163,15 @@ U-mode -> user_vector -> trap_user_handler -> trap_user_return -> user_return
 
 在 `kvm_init()` 创建内核页表时，增加 trampoline 与 `KSTACK(0)` 映射。映射时需要检查页对齐、权限位和物理页来源，避免用户代码获得不应有的内核写权限。
 
+实现记录：
+
+- 已将链接脚本按页对齐的 `trampoline` 物理页映射到内核虚拟地址 `TRAMPOLINE`，权限为只读、可执行。
+- 已从内核物理页区域申请 `proczero` 的内核栈，将其映射到 `KSTACK(0)`，权限为可读、可写。
+- trampoline 和内核栈映射均未设置 `PTE_U`，只能由内核态访问。
+
 ### 4. 创建 proczero
+
+用户页表初始化部分已经完成：`proc_pgtbl_init()` 从内核物理页区域申请顶级页表，并建立 trampoline 和 trapframe 映射。用户页表中的 trampoline 权限为只读、可执行，trapframe 权限为可读、可写；两者都不设置 `PTE_U`，防止用户程序直接访问内核过渡代码和保存的寄存器现场。
 
 实现 `proc_make_first()`，按以下顺序准备第一个用户进程：
 
@@ -171,6 +183,8 @@ U-mode -> user_vector -> trap_user_handler -> trap_user_return -> user_return
 6. 设置内核栈、`context.ra` 和 `context.sp`。
 7. 记录当前进程并通过 `swtch()` 切换到它的内核上下文。
 
+实现记录：上述创建流程已经完成。用户代码映射在 `USER_BASE`，用户栈映射在 `TRAPFRAME` 下方一页；首次上下文切换恢复 `proczero` 的内核栈，并通过 `context.ra` 进入 `trap_user_return()`。
+
 ### 5. 实现用户态 trap 往返
 
 - 在 `trap_user_return()` 中准备返回用户态所需的 CSR 和 trapframe 字段。
@@ -178,13 +192,19 @@ U-mode -> user_vector -> trap_user_handler -> trap_user_return -> user_return
 - 在 `trap_user_handler()` 中识别中断、异常和用户系统调用。
 - 处理完成后返回 `trap_user_return()`，恢复用户页表和寄存器。
 
+实现记录：用户态 trap 往返已经完成。`trap_user_return()` 会关闭中断，将 `stvec` 指向用户 trap 入口，填写内核页表、内核栈和 hart ID，设置 `sepc` 与 `sstatus`，最后跳转到 trampoline 中的 `user_return` 切换用户页表并执行 `sret`。`trap_user_handler()` 进入内核后切换回内核 trap 入口，保存用户 PC，并分别处理时钟中断、UART 中断和用户异常。
+
 ### 6. 响应第一个系统调用
 
 在 `initcode.c` 中调用 `syscall(SYS_helloworld)`。内核识别 syscall 编号后输出 `proczero: hello world!`，将 `sepc` 移到 `ecall` 的下一条指令，再返回用户态。
 
+实现记录：用户程序通过 `a7` 传递系统调用号，内核对 `SYS_helloworld` 输出消息并在 `a0` 中返回 0。处理 `ecall` 后将保存的用户 PC 增加 4，保证连续两次调用都能被执行；未知系统调用返回 -1。
+
 ### 7. 启动第一个用户进程
 
 在 `main()` 完成已有内核资源初始化后，由一个 CPU 创建并启动 `proczero`。其他 CPU 暂时保持现有等待逻辑，避免多个 CPU 同时初始化同一个进程。
+
+实现记录：CPU 0 在完成物理内存、内核页表和 trap 初始化后调用 `proc_make_first()`，通过首次上下文切换启动 `proczero`。
 
 ## 测试用例
 
@@ -225,6 +245,12 @@ proczero: hello world!
 ### 3. 用户态中断测试
 
 `proczero` 进入死循环后，继续观察时钟 tick，并从串口输入字符。时钟和 UART 中断都应经由用户态 trap 入口进入内核，处理后返回原用户执行流。
+
+### 4. 完成验证
+
+- `make build` 可以完整编译并链接内核和 `initcode`。
+- QEMU 启动后连续输出两次 `proczero: hello world!`，验证系统调用处理和 `sepc += 4` 正常。
+- `proczero` 进入用户态死循环后，延迟输入 `uart-test` 仍能正确回显；运行期间周期性时钟中断也未打断用户执行流。
 
 ## 总结
 
