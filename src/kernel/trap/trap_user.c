@@ -1,5 +1,4 @@
 #include "mod.h"
-#include "../../user/syscall_num.h"
 
 // in trampoline.S
 extern char trampoline[];  // 内核和用户切换的代码
@@ -57,22 +56,14 @@ void trap_user_handler()
     }
     else
     {
+        // TODO(LAB-5): 处理 Load Page Fault 和 Store/AMO Page Fault 以扩展用户栈。
         switch (trap_id)
         {
         // U-mode执行ecall产生的系统调用异常
         case 8:
             // ecall固定为4字节，不推进PC会在返回后重复执行同一系统调用。
             proc->tf->user_to_kern_epc += 4;
-            if (proc->tf->a7 == SYS_helloworld)
-            {
-                printf("proczero: hello world!\n");
-                proc->tf->a0 = 0;
-            }
-            else
-            {
-                printf("unknown syscall: %d\n", (int)proc->tf->a7);
-                proc->tf->a0 = (uint64)-1;
-            }
+            syscall();
             break;
         default:
             char *info = trap_id < 16 ? exception_info[trap_id] : "unknown exception";

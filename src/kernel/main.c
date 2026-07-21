@@ -16,6 +16,7 @@ int main()
         printf("cpu %d is booting!\n", cpuid);
 
         pmem_init();
+        // TODO(LAB-5): mmap 节点仓库实现后在这里调用 mmap_init()。
         kvm_init();
         kvm_inithart();
         trap_kernel_init();

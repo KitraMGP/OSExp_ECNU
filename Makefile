@@ -54,6 +54,7 @@ $(TARGET):
 	@mkdir -p $(TARGET)/kernel/mem
 	@mkdir -p $(TARGET)/kernel/trap
 	@mkdir -p $(TARGET)/kernel/proc
+	@mkdir -p $(TARGET)/kernel/syscall
 	@mkdir -p $(TARGET)/user
 
 # 编译规则：将汇编文件(.S)编译为目标文件(.o)

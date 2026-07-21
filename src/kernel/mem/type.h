@@ -134,3 +134,26 @@ typedef pte_t* pgtbl_t;
 
 // 用户空间基地址 (用户页表)
 #define USER_BASE      (PGSIZE)
+
+/* mmap_region 描述一段已经分配的 mmap 区域 */
+typedef struct mmap_region
+{
+    uint64 begin;
+    uint32 npages;
+    struct mmap_region *next;
+} mmap_region_t;
+
+/* mmap_region_node 是 mmap_region 在仓库中的包装 */
+typedef struct mmap_region_node
+{
+    mmap_region_t mmap;
+    struct mmap_region_node *next;
+} mmap_region_node_t;
+
+#define N_MMAP 256
+
+// 为用户栈预留 16 MiB 地址空间。
+#define MMAP_END (TRAPFRAME - 16 * 256 * PGSIZE)
+
+// 单个进程的 mmap 区域最大占用 64 MiB 地址空间。
+#define MMAP_BEGIN (MMAP_END - 64 * 256 * PGSIZE)
