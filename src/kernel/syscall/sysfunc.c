@@ -1,23 +1,46 @@
 #include "mod.h"
 
+enum
+{
+    COPY_TEST_INTS = 5,
+};
+
 // 从用户空间传入 int 数组，成功返回 0。
 uint64 sys_copyin()
 {
-    // TODO: 读取用户数组地址和长度，并复制到内核后输出。
+    uint64 user_addr;
+    uint32 len;
+    int values[COPY_TEST_INTS];
+
+    arg_uint64(0, &user_addr);
+    arg_uint32(1, &len);
+    assert(len <= COPY_TEST_INTS, "sys_copyin: array is too large.");
+    uvm_copyin(myproc()->pgtbl, (uint64)values, user_addr, len * sizeof(values[0]));
+
+    for (uint32 i = 0; i < len; i++)
+        printf("get a number from user: %d\n", values[i]);
     return 0;
 }
 
 // 向用户空间传出 int 数组，成功返回元素数量。
 uint64 sys_copyout()
 {
-    // TODO: 将内核测试数组复制到用户提供的地址。
-    return 0;
+    static const int values[COPY_TEST_INTS] = {1, 2, 3, 4, 5};
+    uint64 user_addr;
+
+    arg_uint64(0, &user_addr);
+    uvm_copyout(myproc()->pgtbl, user_addr, (uint64)values, sizeof(values));
+    return COPY_TEST_INTS;
 }
 
 // 从用户空间传入字符串，成功返回 0。
 uint64 sys_copyinstr()
 {
-    // TODO: 读取并输出用户传入的字符串。
+    char value[STR_MAXLEN + 1];
+
+    memset(value, 0, sizeof(value));
+    arg_str(0, value, STR_MAXLEN);
+    printf("get string for user: %s\n", value);
     return 0;
 }
 

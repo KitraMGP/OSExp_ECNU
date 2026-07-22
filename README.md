@@ -179,32 +179,72 @@ typedef struct mmap_region_node
 
 ## 已完成的工作
 
-LAB-5 模板代码和实验说明已迁移。后续实现过程中在此记录具体改动、关键设计选择和完成状态。
+### 任务 1：系统调用流程和用户/内核数据迁移
+
+- 已接入统一的系统调用分派：用户态 `ecall` 在 `trap_user_handler()` 中推进 `sepc` 后调用 `syscall()`；分派表、`arg_uint32()`、`arg_uint64()` 和 `arg_str()` 使用 `trapframe` 中的 `a0`--`a7`。
+- 在 `src/kernel/mem/uvm.c` 实现了 `uvm_copyin()`、`uvm_copyout()` 与 `uvm_copyin_str()`。三者逐页查找 PTE，按页内剩余字节分段复制；读取要求 `PTE_V | PTE_U | PTE_R`，写入要求 `PTE_V | PTE_U | PTE_W`。无效页、非用户页、权限不足、越过 `VA_MAX` 的地址会触发断言，避免内核直接解引用用户指针。
+- 在 `src/kernel/syscall/sysfunc.c` 实现测试系统调用：`sys_copyout()` 将 `{1, 2, 3, 4, 5}` 写入用户数组；`sys_copyin()` 读取用户数组并逐项输出；`sys_copyinstr()` 读取并输出用户字符串。
+- 首个用户程序仍按原实验设计占用一个用户页面，`heap_top` 保持为 `USER_BASE + PGSIZE`。
+- 测试代码和预期行为与父目录 `ecnu-oslab-2025-task/README.md` 的“测试 1”一致。
 
 ## 测试用例
 
 ### 1. 用户态与内核态数据迁移
 
-- 用户通过 `SYS_copyout` 读取内核中的整数数组。
-- 用户通过 `SYS_copyin` 将数组及长度传回内核。
-- 用户通过 `SYS_copyinstr` 传递字符串。
-- 增加跨页、非页对齐、空字符串、最大长度和非法用户地址测试。
+#### 测试代码
 
-### 2. 堆和栈管理
+`src/user/initcode.c` 中的用户态测试：
+
+```c
+#include "sys.h"
+
+int main()
+{
+    int L[5];
+    char *s = "hello, world";
+
+    syscall(SYS_copyout, L);
+    syscall(SYS_copyin, L, 5);
+    syscall(SYS_copyinstr, s);
+    while (1)
+        ;
+    return 0;
+}
+```
+
+#### 实际结果
+
+```text
+cpu 0 is booting!
+get a number from user: 1
+get a number from user: 2
+get a number from user: 3
+get a number from user: 4
+get a number from user: 5
+get string for user: hello, world
+```
+
+`SYS_copyout` 将五个整数写入用户数组；`SYS_copyin` 按原顺序读回并输出 `1` 至 `5`；`SYS_copyinstr` 输出用户字符串 `hello, world`。输出与参考 README 的测试结果一致。
+
+### 后续任务测试计划
+
+以下测试依赖尚未实现的堆栈、mmap 和页表复制功能，完成对应任务后补充可执行代码与实际结果。
+
+#### 2. 堆和栈管理
 
 - 查询初始堆顶，连续扩展九页，再收缩五页。
 - 测试不跨页、恰好跨页和越过 `MMAP_BEGIN` 的堆顶请求。
 - 在用户函数中创建超过一页的局部数组，分别访问远端元素和首端元素。
 - 测试一次跨越多个未映射页的栈访问，以及低于 `MMAP_END` 的非法访问。
 
-### 3. mmap_region 节点仓库
+#### 3. mmap_region 节点仓库
 
 - 初始化后检查全部 `N_MMAP` 个节点均可分配。
 - 两个 CPU 各申请一半节点，再并发归还。
 - 检查最终空闲节点数量、节点唯一性和链表完整性。
 - 测试仓库耗尽和重复释放的错误处理。
 
-### 4. mmap 与 munmap
+#### 4. mmap 与 munmap
 
 - 以乱序地址创建相离、前后相邻和两侧相邻的映射。
 - 使用 `begin == 0` 自动查找首个足够大的空闲区间。
@@ -212,7 +252,7 @@ LAB-5 模板代码和实验说明已迁移。后续实现过程中在此记录�
 - 测试未对齐地址、未对齐长度、越界和重叠映射。
 - 每次操作后核对 mmap 链表和页表映射保持一致。
 
-### 5. 页表复制与销毁
+#### 5. 页表复制与销毁
 
 - 为代码堆区、mmap 区和多页用户栈写入不同内容后复制页表。
 - 比较新旧地址空间的内容和页表权限，并确认物理页不同。
@@ -221,7 +261,7 @@ LAB-5 模板代码和实验说明已迁移。后续实现过程中在此记录�
 
 ## 测试结果
 
-待各阶段实现完成后，记录构建命令、运行环境、实际输出、边界用例结果及发现的问题。预期输出截图不纳入本文档。
+任务 1 的测试代码、实际输出和结论见“测试用例 → 1. 用户态与内核态数据迁移”。后续任务尚未实现，因此没有伪造测试代码或结果。
 
 ## 总结
 

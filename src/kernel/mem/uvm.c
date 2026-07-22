@@ -2,22 +2,76 @@
 
 /*--------------------part-1: 内核空间与用户空间的数据传递--------------------*/
 
+// 返回用户虚拟地址 va 对应的物理页内地址，并验证用户访问权限。
+static uint64 uvm_user_pa(pgtbl_t pgtbl, uint64 va, int perm)
+{
+    pte_t *pte;
+
+    assert(va < VA_MAX, "uvm_user_pa: invalid user address.");
+    pte = vm_getpte(pgtbl, va, false);
+    assert(pte != NULL && (*pte & PTE_V), "uvm_user_pa: unmapped user page.");
+    assert((*pte & PTE_U) != 0, "uvm_user_pa: non-user page.");
+    assert((*pte & perm) == perm, "uvm_user_pa: insufficient user permission.");
+    assert(!PTE_CHECK(*pte), "uvm_user_pa: non-leaf PTE.");
+
+    return PTE_TO_PA(*pte) + va % PGSIZE;
+}
+
 // 用户地址空间 [src, src + len) 拷贝至内核地址空间 [dst, dst + len)。
 void uvm_copyin(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
 {
-    // TODO: 逐页查询用户页表并将用户数据复制到内核。
+    uint32 n;
+
+    while (len > 0)
+    {
+        n = PGSIZE - src % PGSIZE;
+        if (n > len)
+            n = len;
+        assert(n <= VA_MAX - src, "uvm_copyin: user range overflow.");
+        memmove((void *)dst, (const void *)uvm_user_pa(pgtbl, src, PTE_R), n);
+        dst += n;
+        src += n;
+        len -= n;
+    }
 }
 
 // 内核地址空间 [src, src + len) 拷贝至用户地址空间 [dst, dst + len)。
 void uvm_copyout(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 len)
 {
-    // TODO: 逐页查询用户页表并将内核数据复制到用户空间。
+    uint32 n;
+
+    while (len > 0)
+    {
+        n = PGSIZE - dst % PGSIZE;
+        if (n > len)
+            n = len;
+        assert(n <= VA_MAX - dst, "uvm_copyout: user range overflow.");
+        memmove((void *)uvm_user_pa(pgtbl, dst, PTE_W), (const void *)src, n);
+        dst += n;
+        src += n;
+        len -= n;
+    }
 }
 
 // 用户字符串拷贝到内核，最多拷贝 maxlen 字节，遇到 '\0' 终止。
 void uvm_copyin_str(pgtbl_t pgtbl, uint64 dst, uint64 src, uint32 maxlen)
 {
-    // TODO: 跨页复制用户字符串，并在 '\0' 或 maxlen 处停止。
+    uint32 n;
+
+    while (maxlen > 0)
+    {
+        n = PGSIZE - src % PGSIZE;
+        if (n > maxlen)
+            n = maxlen;
+        assert(n <= VA_MAX - src, "uvm_copyin_str: user range overflow.");
+        memmove((void *)dst, (const void *)uvm_user_pa(pgtbl, src, PTE_R), n);
+        for (uint32 i = 0; i < n; i++)
+            if (((char *)dst)[i] == '\0')
+                return;
+        dst += n;
+        src += n;
+        maxlen -= n;
+    }
 }
 
 /*--------------------part-2: mmap_region 相关--------------------*/
