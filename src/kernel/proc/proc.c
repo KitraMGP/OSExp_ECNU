@@ -72,7 +72,7 @@ void proc_make_first()
     proczero.tf->sp = TRAPFRAME;
     proczero.heap_top = USER_BASE + PGSIZE;
     proczero.ustack_npage = 1;
-    // TODO(LAB-5): 初始化并维护 proczero 的 mmap 区域链表。
+    proczero.mmap = NULL;
 
     // swtch恢复ra和sp后，会在进程内核栈上执行trap_user_return。
     proczero.kstack = KSTACK(proczero.pid);

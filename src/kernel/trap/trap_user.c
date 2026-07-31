@@ -56,7 +56,6 @@ void trap_user_handler()
     }
     else
     {
-        // TODO(LAB-5): 处理 Load Page Fault 和 Store/AMO Page Fault 以扩展用户栈。
         switch (trap_id)
         {
         // U-mode执行ecall产生的系统调用异常
@@ -65,6 +64,23 @@ void trap_user_handler()
             proc->tf->user_to_kern_epc += 4;
             syscall();
             break;
+        case 13:
+        case 15:
+        {
+            uint64 new_npage = uvm_ustack_grow(proc->pgtbl,
+                                                proc->ustack_npage, stval);
+            if (new_npage == (uint64)-1)
+            {
+                printf("invalid user stack fault: stval = %p\n", stval);
+                panic("trap_user_handler: stack growth failed");
+            }
+            printf("user page fault: trap_id = %d, stval = %p\n",
+                   (int)trap_id, stval);
+            printf("user stack pages: %d -> %d\n",
+                   (int)proc->ustack_npage, (int)new_npage);
+            proc->ustack_npage = new_npage;
+            break;
+        }
         default:
             char *info = trap_id < 16 ? exception_info[trap_id] : "unknown exception";
             printf("\nunexpected user exception: %s\n", info);

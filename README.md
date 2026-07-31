@@ -182,37 +182,51 @@ typedef struct mmap_region_node
 ### 任务 1：系统调用流程和用户/内核数据迁移
 
 - 已接入统一的系统调用分派：用户态 `ecall` 在 `trap_user_handler()` 中推进 `sepc` 后调用 `syscall()`；分派表、`arg_uint32()`、`arg_uint64()` 和 `arg_str()` 使用 `trapframe` 中的 `a0`--`a7`。
-- 在 `src/kernel/mem/uvm.c` 实现了 `uvm_copyin()`、`uvm_copyout()` 与 `uvm_copyin_str()`。三者逐页查找 PTE，按页内剩余字节分段复制；读取要求 `PTE_V | PTE_U | PTE_R`，写入要求 `PTE_V | PTE_U | PTE_W`。无效页、非用户页、权限不足、越过 `VA_MAX` 的地址会触发断言，避免内核直接解引用用户指针。
-- 在 `src/kernel/syscall/sysfunc.c` 实现测试系统调用：`sys_copyout()` 将 `{1, 2, 3, 4, 5}` 写入用户数组；`sys_copyin()` 读取用户数组并逐项输出；`sys_copyinstr()` 读取并输出用户字符串。
-- 首个用户程序仍按原实验设计占用一个用户页面，`heap_top` 保持为 `USER_BASE + PGSIZE`。
-- 测试代码和预期行为与父目录 `ecnu-oslab-2025-task/README.md` 的“测试 1”一致。
+- 已实现逐页检查权限并处理跨页范围的 `uvm_copyin()`、`uvm_copyout()` 与 `uvm_copyin_str()`。
+- 已实现本实验使用的 `sys_copyin()`、`sys_copyout()` 和 `sys_copyinstr()` 测试服务。
 
-## 测试用例
+### 任务 2：堆伸缩和栈缺页扩展
+
+- `sys_brk()` 支持查询、增长、收缩和保持堆顶不变；失败时返回 `-1`，成功后同步更新 `proc->heap_top`。
+- `uvm_heap_grow()` 和 `uvm_heap_ungrow()` 以覆盖半开字节区间所需的页面为单位增删映射，正确处理非页对齐堆顶，并限制堆顶不超过 `MMAP_BEGIN`。
+- 用户 trap 已处理异常 13 和 15。`uvm_ustack_grow()` 根据 `stval` 一次映射故障页到旧栈底之间的全部页面，成功后更新 `proc->ustack_npage`，并拒绝低于 `MMAP_END` 的地址。
+
+### 任务 3：mmap_region 节点仓库
+
+- `mmap_init()` 初始化全部 `N_MMAP` 个节点及仓库自旋锁，并在启动 CPU 完成物理内存初始化后调用。
+- `mmap_region_alloc()` 和 `mmap_region_free()` 在锁内摘取或归还节点；分配和释放时清理节点状态。
+- 释放接口检查节点地址、对齐及重复释放，避免破坏空闲链表。
+- 使用两个 CPU 各并发申请、归还 128 个节点，归还后重新取得了 256 个互不重复节点。
+
+### 任务 4：mmap 与 munmap
+
+- 首进程初始化空 mmap 链表；`sys_mmap()` 和 `sys_munmap()` 已接入系统调用表并校验页对齐和长度。
+- `uvm_mmap()` 支持指定地址和 `begin == 0` 时的首个适配查找，拒绝越界及重叠请求，并合并前后相邻区域。
+- `uvm_munmap()` 支持完整删除、头部裁剪、尾部裁剪和中间拆分，同时释放对应用户物理页。
+- 未对齐、越界、重叠或未映射的用户请求返回 `-1`，不会作为用户输入错误触发内核 panic。
+
+### 任务 5：用户页表复制与销毁
+
+- `destroy_pgtbl()` 递归遍历三级 SV39 页表：非叶子项递归销毁下级页表，叶子项释放进程私有用户页，最后释放当前页表页。
+- `uvm_destroy_pgtbl()` 先释放进程独有的 trapframe 映射并仅解除共享 trampoline 映射，再递归回收其余用户页和所有页表页。
+- `uvm_copy_pgtbl()` 根据进程元数据分别深拷贝代码/数据/堆、每段 mmap 和用户栈；新页保留原 PTE 权限，但使用不同物理页。
+- 复制入口验证堆栈边界、mmap 链表顺序和区间范围，避免错误元数据导致重复复制或越界。
+
+## 测试用例与实际结果
 
 ### 1. 用户态与内核态数据迁移
 
-#### 测试代码
+先前使用用户数组和字符串运行测试，实际输出为：
 
-`src/user/initcode.c` 中的用户态测试：
+测试代码：
 
 ```c
-#include "sys.h"
-
-int main()
-{
-    int L[5];
-    char *s = "hello, world";
-
-    syscall(SYS_copyout, L);
-    syscall(SYS_copyin, L, 5);
-    syscall(SYS_copyinstr, s);
-    while (1)
-        ;
-    return 0;
-}
+int L[5];
+char *s = "hello, world";
+syscall(SYS_copyout, L);
+syscall(SYS_copyin, L, 5);
+syscall(SYS_copyinstr, s);
 ```
-
-#### 实际结果
 
 ```text
 cpu 0 is booting!
@@ -224,45 +238,163 @@ get a number from user: 5
 get string for user: hello, world
 ```
 
-`SYS_copyout` 将五个整数写入用户数组；`SYS_copyin` 按原顺序读回并输出 `1` 至 `5`；`SYS_copyinstr` 输出用户字符串 `hello, world`。输出与参考 README 的测试结果一致。
+### 2. 堆和栈管理
 
-### 后续任务测试计划
+用户测试先查询堆顶，将堆扩展九页加 123 字节，在第九个新增页写入 `heap`；随后收缩五页，在仍保留的页面写入 `kept`。测试还使用 16 KiB 局部数组分别访问高端和低端地址，触发一次跨多个页面的栈扩展。实际输出为：
 
-以下测试依赖尚未实现的堆栈、mmap 和页表复制功能，完成对应任务后补充可执行代码与实际结果。
+用户测试的关键代码：
 
-#### 2. 堆和栈管理
+```c
+char *heap = (char *)syscall(SYS_brk, 0);
+char stack[PGSIZE * 4];
 
-- 查询初始堆顶，连续扩展九页，再收缩五页。
-- 测试不跨页、恰好跨页和越过 `MMAP_BEGIN` 的堆顶请求。
-- 在用户函数中创建超过一页的局部数组，分别访问远端元素和首端元素。
-- 测试一次跨越多个未映射页的栈访问，以及低于 `MMAP_END` 的非法访问。
+syscall(SYS_brk, heap + 9 * PGSIZE + 123);
+syscall(SYS_brk, heap + 9 * PGSIZE + 123); // 堆顶不变
+heap[8 * PGSIZE] = 'h';                    // 访问新增堆页
+syscall(SYS_brk, heap + 4 * PGSIZE + 123);
+heap[3 * PGSIZE] = 'k';                    // 访问收缩后保留页
 
-#### 3. mmap_region 节点仓库
+stack[3 * PGSIZE] = 'd';                   // 触发第一次栈增长
+stack[0] = 's';                             // 一次跨多个页面增长
+```
 
-- 初始化后检查全部 `N_MMAP` 个节点均可分配。
-- 两个 CPU 各申请一半节点，再并发归还。
-- 检查最终空闲节点数量、节点唯一性和链表完整性。
-- 测试仓库耗尽和重复释放的错误处理。
+```text
+cpu 0 is booting!
+brk lookup: heap_top = 0x0000000000002000
+brk grow: heap_top = 0x0000000000002000 -> 0x000000000000b07b
+brk unchanged: heap_top = 0x000000000000b07b
+get string for user: heap
+brk ungrow: heap_top = 0x000000000000b07b -> 0x000000000000607b
+get string for user: kept
+user page fault: trap_id = 15, stval = 0x0000003fffffcff0
+user stack pages: 1 -> 2
+get string for user: deep
+user page fault: trap_id = 15, stval = 0x0000003fffff9ff0
+user stack pages: 2 -> 5
+get string for user: stack
+```
 
-#### 4. mmap 与 munmap
+### 3. mmap_region 节点仓库
 
-- 以乱序地址创建相离、前后相邻和两侧相邻的映射。
-- 使用 `begin == 0` 自动查找首个足够大的空闲区间。
-- 分别测试完整解除、删除头部、删除尾部和从中间拆分。
-- 测试未对齐地址、未对齐长度、越界和重叠映射。
-- 每次操作后核对 mmap 链表和页表映射保持一致。
+临时内核测试让两个 CPU 各申请一半节点，并发归还后由 CPU 0 重新申请全部节点并逐一检查地址唯一性。实际输出为：
 
-#### 5. 页表复制与销毁
+临时双核测试的核心同步和链表操作代码：
 
-- 为代码堆区、mmap 区和多页用户栈写入不同内容后复制页表。
-- 比较新旧地址空间的内容和页表权限，并确认物理页不同。
-- 修改副本后检查原地址空间不受影响。
-- 销毁副本并核对用户物理页与多级页表页均被回收，共享 trampoline 未被释放。
+```c
+for (int i = cpuid * (N_MMAP / 2);
+     i < (cpuid + 1) * (N_MMAP / 2); i++)
+    nodes[i] = mmap_region_alloc();
+allocated[cpuid] = true;
+while (!allocated[0] || !allocated[1]);
+
+for (int i = cpuid * (N_MMAP / 2);
+     i < (cpuid + 1) * (N_MMAP / 2); i++)
+    mmap_region_free(nodes[i]);
+```
+
+```text
+cpu 0 is booting!
+cpu 1 is booting!
+mmap node concurrency: 256 unique nodes recovered
+```
+
+验证完成后已恢复正常的 `main()` 启动路径，未保留测试屏障和临时数组。
+
+### 4. mmap 与 munmap
+
+当前 `src/user/initcode.c` 使用乱序指定地址建立映射，使节点发生前向、后向和两侧合并；随后使用 `begin == 0` 验证首个适配地址，并覆盖完整删除、头部裁剪、尾部裁剪和中间拆分。测试还确认重叠、未对齐、越界及未映射请求返回 `-1`。全部释放后重新自动映射四页，实际写入并读回字符串：
+
+当前 `src/user/initcode.c` 中的核心测试代码：
+
+```c
+syscall(SYS_mmap, MMAP_BEGIN + 4 * PGSIZE, 3 * PGSIZE);
+syscall(SYS_mmap, MMAP_BEGIN + 10 * PGSIZE, 2 * PGSIZE);
+syscall(SYS_mmap, MMAP_BEGIN + 2 * PGSIZE, 2 * PGSIZE);
+syscall(SYS_mmap, MMAP_BEGIN + 12 * PGSIZE, PGSIZE);
+syscall(SYS_mmap, MMAP_BEGIN + 7 * PGSIZE, 3 * PGSIZE);
+syscall(SYS_mmap, MMAP_BEGIN, 2 * PGSIZE);
+char *auto_map = (char *)syscall(SYS_mmap, 0, 10 * PGSIZE);
+
+// 重叠、未对齐、越界和未映射请求必须失败。
+if (syscall(SYS_mmap, MMAP_BEGIN + 4 * PGSIZE, PGSIZE) != -1 ||
+    syscall(SYS_mmap, MMAP_BEGIN + 1, PGSIZE) != -1 ||
+    syscall(SYS_mmap, MMAP_END, PGSIZE) != -1 ||
+    syscall(SYS_munmap, MMAP_BEGIN + 23 * PGSIZE, PGSIZE) != -1)
+    while (1);
+
+// 覆盖中间拆分、完整删除、头部裁剪和尾部裁剪。
+syscall(SYS_munmap, MMAP_BEGIN + 10 * PGSIZE, 5 * PGSIZE);
+syscall(SYS_munmap, MMAP_BEGIN, 10 * PGSIZE);
+syscall(SYS_munmap, MMAP_BEGIN + 17 * PGSIZE, 2 * PGSIZE);
+syscall(SYS_munmap, MMAP_BEGIN + 15 * PGSIZE, 2 * PGSIZE);
+```
+
+代表性的实际输出如下；每次合法操作后还会通过 `vm_print()` 输出对应页表，以下只保留便于核对链表变化的行：
+
+```text
+cpu 0 is booting!
+mmap: begin = 0x0000003ffb002000, len = 12288
+alloced mmap_region: 0x0000003ffb002000 ~ 0x0000003ffb005000
+mmap: begin = 0x0000003ffb005000, len = 12288
+alloced mmap_region: 0x0000003ffb000000 ~ 0x0000003ffb00b000
+munmap: begin = 0x0000003ffb008000, len = 20480
+alloced mmap_region: 0x0000003ffaffe000 ~ 0x0000003ffb008000
+alloced mmap_region: 0x0000003ffb00d000 ~ 0x0000003ffb015000
+mmap: begin = 0x0000003ffaffe000, len = 16384
+get string for user: mmap
+munmap: begin = 0x0000003ffaffe000, len = 16384
+```
+
+该输出只有在自动映射地址、非法请求返回值、解除映射各分支及最终用户页读写全部通过后才会出现。
+
+### 5. 用户页表复制与销毁
+
+内核测试在首进程启动前构造两套独立页表。旧地址空间包含三页代码/堆、两段共三页 mmap 和三页用户栈；新旧页表各自还有独立 trapframe，并共享 trampoline。测试逐页检查：
+
+- 内容逐字节一致；
+- PTE 权限完全一致；
+- 新旧虚拟页对应不同物理页；
+- 修改副本后原页内容不变；
+- 两套页表销毁后，全部用户页和三级页表页可从对应物理页池重新分配。
+
+内核测试的关键断言代码：
+
+```c
+uvm_copy_pgtbl(old, new, USER_BASE + 3 * PGSIZE, 3, &mmap_1);
+for (uint32 i = 0; i < sizeof(vas) / sizeof(vas[0]); i++) {
+    pte_t *old_pte = vm_getpte(old, vas[i], false);
+    pte_t *new_pte = vm_getpte(new, vas[i], false);
+    assert(PTE_FLAGS(*old_pte) == PTE_FLAGS(*new_pte),
+           "pgtbl test: permissions changed.");
+    assert(PTE_TO_PA(*old_pte) != PTE_TO_PA(*new_pte),
+           "pgtbl test: user page shared.");
+}
+uvm_destroy_pgtbl(old);
+uvm_destroy_pgtbl(new);
+test_expect_recycled(test_user_pages, test_user_npage, false);
+test_expect_recycled(test_pgtbl_pages, test_pgtbl_npage, true);
+```
+
+实际输出为：
+
+```text
+cpu 0 is booting!
+pgtbl copy: content permissions isolation pass
+pgtbl destroy: 20 user pages and 14 table pages recycled
+get string for user: mmap
+```
+
+其中 20 个用户页包括两套地址空间各自的 9 个普通用户页和 1 个 trapframe；14 个内核页包括两套地址空间实际建立的全部三级页表页。最后一行说明销毁测试结束后，原有 mmap 用户场景仍能正常启动和运行。
 
 ## 测试结果
 
-任务 1 的测试代码、实际输出和结论见“测试用例 → 1. 用户态与内核态数据迁移”。后续任务尚未实现，因此没有伪造测试代码或结果。
+- `make build` 成功完成用户程序、内核对象和内核 ELF 的编译链接。
+- 堆和栈测试在 QEMU 双核配置下通过。
+- mmap 节点仓库双核并发测试通过，归还后 256 个节点全部可重新分配且地址唯一。
+- mmap/munmap 综合测试和非法参数测试在 QEMU 下通过。
+- 页表深拷贝测试通过：内容、权限和修改隔离符合预期，新旧普通用户页没有共享物理页。
+- 页表销毁测试通过：20 个用户页和 14 个三级页表页全部回收到对应物理页池，共享 trampoline 未被释放。
 
 ## 总结
 
-LAB-5 将单一的演示系统调用扩展为统一的系统调用框架，并建立用户堆、自动增长栈和 mmap 区域的管理机制。实验完成后，内核应能根据用户页表安全地迁移数据，维护不同虚拟内存区域的边界与元数据，并复制或销毁完整用户地址空间，为后续创建和回收多个进程提供基础。
+LAB-5 已完成统一系统调用与数据迁移、用户堆伸缩、缺页驱动的用户栈扩展、带锁 mmap 节点仓库、mmap/munmap，以及用户地址空间的深拷贝与递归销毁。系统已具备 LAB-6 创建、复制和回收多进程地址空间所需的内存管理基础。
