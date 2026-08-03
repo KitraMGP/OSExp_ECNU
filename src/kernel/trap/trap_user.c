@@ -43,6 +43,7 @@ void trap_user_handler()
         {
         case 1:
             timer_interrupt_handler();
+            proc_yield();
             break;
         case 9:
             external_interrupt_handler();

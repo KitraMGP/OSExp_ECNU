@@ -90,6 +90,8 @@ void trap_kernel_handler()
         {
         case 1: // S 模式软件中断
             timer_interrupt_handler();
+            if (myproc() != NULL)
+                proc_yield();
             break;
         case 9: // S 模式外设中断
             external_interrupt_handler();

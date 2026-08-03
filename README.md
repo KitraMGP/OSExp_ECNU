@@ -145,18 +145,19 @@ uint64 sys_sleep(uint64 ntick);    // 进程睡眠ntick个时钟周期
 - `proc_free` 在持有进程锁的前提下释放 mmap 描述节点和用户页表资源，将进程恢复为 `UNUSED`。
 - `proc_make_first` 改为使用 `proc_alloc` 创建 `proczero`，初始化完成后置为 `RUNNABLE` 并解锁，调度切换由后续调度器负责。
 - `kvm_init` 为全部 `N_PROC` 个进程槽位分配并映射独立内核栈，栈之间保留保护页。
+- `proc_scheduler` 循环扫描 `proc_list`，选择 `RUNNABLE` 进程，将其置为 `RUNNING` 后从 CPU 调度器上下文切换到进程上下文；进程返回后清除 `CPU->proc` 并释放进程锁。
+- `proc_sched` 验证当前进程锁、中断关闭和单层中断嵌套，切换回 CPU 调度器上下文。
+- `proc_yield` 将当前 `RUNNING` 进程置为 `RUNNABLE` 并让出 CPU；用户态和内核态时钟中断处理完成后均会触发该逻辑，内核空闲调度器不参与抢占。
 
 仍待完成：
 
-- `proc_sched`/`proc_scheduler`：循环扫描调度。
-- `proc_yield`：抢占式调度，并在 `trap_user.c`/`trap_kernel.c` 的时钟中断处理完成后调用。
 - `proc_fork`/`proc_exit`/`proc_wait`/`proc_reparent`/`proc_try_wakeup`：生命周期。
 - `proc_sleep`/`proc_wakeup`：睡眠唤醒。
 - `sleeplock_*`：睡眠锁。
 - `timer_wait` 与 `timer_update` 中的 `proc_wakeup` 逻辑。
 - 新系统调用 `sys_print_str`/`sys_print_int`/`sys_getpid`/`sys_fork`/`sys_wait`/`sys_exit`/`sys_sleep` 的实现。
 
-本次验证：`make build` 成功；`make run` 实际输出 `cpu 0 is booting!`、`cpu 1 is booting!`，随后因调度器尚未实现而输出 `panic! main: never back!`。
+本次验证：`make build` 成功；`make run` 实际输出 `cpu 0 is booting!`、`cpu 1 is booting!`，QEMU 在一个完整时钟窗口内持续运行，未再出现 `main: never back!`、断言或 panic。当前测试 1 的打印系统调用尚未实现，因此未产生用户态输出。
 
 ## 测试用例
 

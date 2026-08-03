@@ -209,7 +209,14 @@ int proc_fork()
 */
 void proc_yield()
 {
+    proc_t *proc = myproc();
+    assert(proc != NULL, "proc_yield: no current process.");
 
+    spinlock_acquire(&proc->lk);
+    assert(proc->state == RUNNING, "proc_yield: process is not running.");
+    proc->state = RUNNABLE;
+    proc_sched();
+    spinlock_release(&proc->lk);
 }
 
 /*
@@ -270,20 +277,50 @@ void proc_wakeup(void *sleep_space)
 
 }
 
-/* 
+/*
     用户进程切换到调度器
     tips: 调用者保证持有当前进程的锁
 */
 void proc_sched()
 {
+    proc_t *proc = myproc();
+    cpu_t *cpu = mycpu();
 
+    assert(proc != NULL, "proc_sched: no current process.");
+    assert(spinlock_holding(&proc->lk), "proc_sched: process lock not held.");
+    assert(proc->state != RUNNING, "proc_sched: process is still running.");
+    assert(cpu->noff == 1, "proc_sched: unexpected interrupt nesting.");
+    assert(intr_get() == 0, "proc_sched: interrupt enabled.");
+
+    swtch(&proc->ctx, &cpu->ctx);
 }
 
-/* 
+/*
     调度器
     RUNNABLE->RUNNING
 */
 void proc_scheduler()
 {
+    cpu_t *cpu = mycpu();
 
+    for (;;)
+    {
+        intr_on();
+        for (int i = 0; i < N_PROC; i++)
+        {
+            proc_t *proc = &proc_list[i];
+            spinlock_acquire(&proc->lk);
+            if (proc->state != RUNNABLE)
+            {
+                spinlock_release(&proc->lk);
+                continue;
+            }
+
+            proc->state = RUNNING;
+            cpu->proc = proc;
+            swtch(&cpu->ctx, &proc->ctx);
+            cpu->proc = NULL;
+            spinlock_release(&proc->lk);
+        }
+    }
 }
