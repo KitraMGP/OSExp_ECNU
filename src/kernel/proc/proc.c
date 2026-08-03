@@ -37,32 +37,95 @@ static int alloc_pid()
 /* 释放进程锁 + trap_user_return */
 static void proc_return()
 {
-
+    proc_t *proc = myproc();
+    assert(proc != NULL, "proc_return: no current process.");
+    spinlock_release(&proc->lk);
+    trap_user_return();
 }
 
 /* 进程模块初始化 */
 void proc_init()
-{    
+{
+    spinlock_init(&pid_lk, "pid");
+    global_pid = 1;
 
+    for (int i = 0; i < N_PROC; i++)
+    {
+        memset(&proc_list[i], 0, sizeof(proc_list[i]));
+        spinlock_init(&proc_list[i].lk, "proc");
+        proc_list[i].state = UNUSED;
+        proc_list[i].kstack = KSTACK(i);
+    }
 }
 
-/* 
+/*
     申请一个UNUSED进程结构体(返回时带锁)
     并执行通用的初始化逻辑
 */
 proc_t *proc_alloc()
 {
-    // TODO(lab-6): 扫描proc_list, 找到UNUSED进程, 完成通用初始化后带锁返回
+    for (int i = 0; i < N_PROC; i++)
+    {
+        proc_t *proc = &proc_list[i];
+        spinlock_acquire(&proc->lk);
+        if (proc->state != UNUSED)
+        {
+            spinlock_release(&proc->lk);
+            continue;
+        }
+
+        proc->pid = alloc_pid();
+        proc->parent = NULL;
+        proc->exit_code = 0;
+        proc->sleep_space = NULL;
+        proc->pgtbl = NULL;
+        proc->heap_top = 0;
+        proc->ustack_npage = 0;
+        proc->mmap = NULL;
+        proc->tf = NULL;
+        memset(&proc->ctx, 0, sizeof(proc->ctx));
+        proc->ctx.ra = (uint64)proc_return;
+        proc->ctx.sp = proc->kstack + PGSIZE;
+        return proc;
+    }
+
     return NULL;
 }
 
-/* 
+/*
     回收一个进程结构体并释放它包含的资源
     tips: 调用者需要持有进程锁
 */
 void proc_free(proc_t *p)
 {
+    assert(p != NULL, "proc_free: NULL process.");
+    assert(spinlock_holding(&p->lk), "proc_free: process lock not held.");
+    assert(p->state == ZOMBIE, "proc_free: process is not zombie.");
 
+    mmap_region_t *mmap = p->mmap;
+    while (mmap != NULL)
+    {
+        mmap_region_t *next = mmap->next;
+        mmap_region_free(mmap);
+        mmap = next;
+    }
+    if (p->pgtbl != NULL)
+        uvm_destroy_pgtbl(p->pgtbl);
+
+    p->pid = 0;
+    p->name[0] = '\0';
+    p->state = UNUSED;
+    p->parent = NULL;
+    p->exit_code = 0;
+    p->sleep_space = NULL;
+    p->pgtbl = NULL;
+    p->heap_top = 0;
+    p->ustack_npage = 0;
+    p->mmap = NULL;
+    p->tf = NULL;
+    memset(&p->ctx, 0, sizeof(p->ctx));
+    p->ctx.ra = (uint64)proc_return;
+    p->ctx.sp = p->kstack + PGSIZE;
 }
 
 /* 
@@ -100,13 +163,10 @@ pgtbl_t proc_pgtbl_init(uint64 trapframe)
 */
 void proc_make_first()
 {
-    // TODO(lab-6): 改为通过proc_alloc申请proczero, 只完成初始化并解锁返回,
-    // 不应直接调用swtch; 调度由proc_scheduler统一完成。
-    // 迁移阶段: 继承lab-5行为, 直接使用proc_list[0]。
-    proczero = &proc_list[0];
+    proczero = proc_alloc();
+    assert(proczero != NULL, "proc_make_first: no process slot.");
 
     // trapframe保存在用户物理页中，但只通过内核映射访问。
-    proczero->pid = 0;
     proczero->tf = (trapframe_t *)pmem_alloc(false);
     proczero->pgtbl = proc_pgtbl_init((uint64)proczero->tf);
 
@@ -128,16 +188,8 @@ void proc_make_first()
     proczero->heap_top = USER_BASE + PGSIZE;
     proczero->ustack_npage = 1;
     proczero->mmap = NULL;
-
-    // swtch恢复ra和sp后，会在进程内核栈上执行trap_user_return。
-    proczero->kstack = KSTACK(proczero->pid);
-    proczero->ctx.ra = (uint64)trap_user_return;
-    proczero->ctx.sp = proczero->kstack + PGSIZE;
-
-    // 先登记当前进程，返回用户态时才能通过myproc()取得它。
-    cpu_t *cpu = mycpu();
-    cpu->proc = proczero;
-    swtch(&cpu->ctx, &proczero->ctx);
+    proczero->state = RUNNABLE;
+    spinlock_release(&proczero->lk);
 }
 
 /*

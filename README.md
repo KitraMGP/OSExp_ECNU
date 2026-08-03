@@ -138,15 +138,25 @@ uint64 sys_sleep(uint64 ntick);    // 进程睡眠ntick个时钟周期
 
 ## 待实现任务（TODO）
 
-- `proc_init`/`proc_alloc`/`proc_free`：进程仓库初始化与申请/释放。
-- `proc_make_first`：改为通过 `proc_alloc` 申请 proczero，只完成初始化并解锁，不再直接 `swtch`。
+已完成本次任务：
+
+- `proc_init` 初始化进程数组、进程锁、全局 PID，并为每个进程槽位记录固定内核栈虚拟地址。
+- `proc_alloc` 扫描 `proc_list` 申请 `UNUSED` 槽位，分配 PID，初始化通用字段和进程上下文；返回时持有进程锁，初始返回地址为 `proc_return`。
+- `proc_free` 在持有进程锁的前提下释放 mmap 描述节点和用户页表资源，将进程恢复为 `UNUSED`。
+- `proc_make_first` 改为使用 `proc_alloc` 创建 `proczero`，初始化完成后置为 `RUNNABLE` 并解锁，调度切换由后续调度器负责。
+- `kvm_init` 为全部 `N_PROC` 个进程槽位分配并映射独立内核栈，栈之间保留保护页。
+
+仍待完成：
+
 - `proc_sched`/`proc_scheduler`：循环扫描调度。
 - `proc_yield`：抢占式调度，并在 `trap_user.c`/`trap_kernel.c` 的时钟中断处理完成后调用。
 - `proc_fork`/`proc_exit`/`proc_wait`/`proc_reparent`/`proc_try_wakeup`：生命周期。
 - `proc_sleep`/`proc_wakeup`：睡眠唤醒。
 - `sleeplock_*`：睡眠锁。
-- `timer_wait` 与 `timer_update` 中的 `proc_wakeup` 逻辑；`kvm_init` 多进程内核栈映射。
+- `timer_wait` 与 `timer_update` 中的 `proc_wakeup` 逻辑。
 - 新系统调用 `sys_print_str`/`sys_print_int`/`sys_getpid`/`sys_fork`/`sys_wait`/`sys_exit`/`sys_sleep` 的实现。
+
+本次验证：`make build` 成功；`make run` 实际输出 `cpu 0 is booting!`、`cpu 1 is booting!`，随后因调度器尚未实现而输出 `panic! main: never back!`。
 
 ## 测试用例
 

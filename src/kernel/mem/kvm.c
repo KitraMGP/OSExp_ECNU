@@ -143,10 +143,13 @@ void kvm_init()
     vm_mappages(kernel_pgtbl, TRAMPOLINE, (uint64)trampoline,
                 PGSIZE, PTE_R | PTE_X);
 
-    // 内核栈使用内核物理页，并与相邻内核栈之间保留未映射的保护页。
-    uint64 kstack_page = (uint64)pmem_alloc(true);
-    vm_mappages(kernel_pgtbl, KSTACK(0), kstack_page,
-                PGSIZE, PTE_R | PTE_W);
+    // 每个进程槽位拥有一页固定内核栈，槽位之间保留一页未映射的保护页。
+    for (int i = 0; i < N_PROC; i++)
+    {
+        uint64 kstack_page = (uint64)pmem_alloc(true);
+        vm_mappages(kernel_pgtbl, KSTACK(i), kstack_page,
+                    PGSIZE, PTE_R | PTE_W);
+    }
 }
 
 // 每个CPU都需要调用, 从不使用页表切换到使用内核页表
