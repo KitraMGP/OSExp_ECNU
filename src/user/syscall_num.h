@@ -8,3 +8,14 @@
 #define SYS_wait 8          // 等待子进程退出
 #define SYS_exit 9          // 进程退出
 #define SYS_sleep 10        // 进程睡眠一段时间
+#define SYS_alloc_block 11  // 从data_bitmap申请1个block
+#define SYS_free_block 12   // 向data_bitmap释放1个block
+#define SYS_alloc_inode 13  // 从inode_bitmap申请1个inode
+#define SYS_free_inode 14   // 向inode_bitmap释放1个inode
+#define SYS_show_bitmap 15  // 输出目标bitmap的状态
+#define SYS_get_block 16    // 获取描述block的buffer
+#define SYS_read_block 17   // 将buffer数据拷贝到用户空间
+#define SYS_write_block 18  // 将用户数据写入buffer和磁盘
+#define SYS_put_block 19    // 释放描述block的buffer
+#define SYS_show_buffer 20  // 输出buffer链表状态
+#define SYS_flush_buffer 21 // 释放非活跃buffer持有的物理内存

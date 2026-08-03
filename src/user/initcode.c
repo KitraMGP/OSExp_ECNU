@@ -1,98 +1,117 @@
-// test-1: sys_getpid and sys_print
+// test-1: read superblock
 #include "sys.h"
 
 int main()
 {
-    int pid = syscall(SYS_getpid);
-    if (pid == 1) {
-        syscall(SYS_print_str, "\nproczero: hello ");
-        syscall(SYS_print_str, "world!\n");
-    }
+    syscall(SYS_print_str, "hello, world!\n");
     while (1);
 }
 
-
-
-// test-2: fork
+// test-2: bitmap
 // #include "sys.h"
-
+//
+// #define NUM 20
+// #define N_BUFFER 8
+//
 // int main()
 // {
-// 	syscall(SYS_print_str, "level-1!\n");
-// 	syscall(SYS_fork);
-// 	syscall(SYS_print_str, "level-2!\n");
-// 	syscall(SYS_fork);
-// 	syscall(SYS_print_str, "level-3!\n");
-// 	while(1);
+//     unsigned int block_num[NUM];
+//     unsigned int inode_num[NUM];
+//
+//     for (int i = 0; i < NUM; i++)
+//         block_num[i] = syscall(SYS_alloc_block);
+//
+//     syscall(SYS_flush_buffer, N_BUFFER);
+//     syscall(SYS_show_bitmap, 0);
+//
+//     for (int i = 0; i < NUM; i += 2)
+//         syscall(SYS_free_block, block_num[i]);
+//
+//     syscall(SYS_flush_buffer, N_BUFFER);
+//     syscall(SYS_show_bitmap, 0);
+//
+//     for (int i = 1; i < NUM; i += 2)
+//         syscall(SYS_free_block, block_num[i]);
+//
+//     syscall(SYS_flush_buffer, N_BUFFER);
+//     syscall(SYS_show_bitmap, 0);
+//
+//     for (int i = 0; i < NUM; i++)
+//         inode_num[i] = syscall(SYS_alloc_inode);
+//
+//     syscall(SYS_flush_buffer, N_BUFFER);
+//     syscall(SYS_show_bitmap, 1);
+//
+//     for (int i = 0; i < NUM; i++)
+//         syscall(SYS_free_inode, inode_num[i]);
+//
+//     syscall(SYS_flush_buffer, N_BUFFER);
+//     syscall(SYS_show_bitmap, 1);
+//
+//     while (1);
 // }
 
-
-// test-3: fork wait exit 综合测试
+// test-3: buffer
 // #include "sys.h"
-
+//
 // #define PGSIZE 4096
-// #define VA_MAX (1ul << 38)
-// #define MMAP_END (VA_MAX - (2 + 16 * 256) * PGSIZE)
-// #define MMAP_BEGIN (MMAP_END - 64 * 256 * PGSIZE)
-
+// #define N_BUFFER 8
+// #define BLOCK_BASE 5000
+//
 // int main()
 // {
-// 	int pid, i;
-// 	char *str1, *str2, *str3 = "STACK_REGION\n\n";
-// 	char *tmp1 = "MMAP_REGION\n", *tmp2 = "HEAP_REGION\n";
-	
-// 	str1 = (char*)syscall(SYS_mmap, MMAP_BEGIN, PGSIZE);
-// 	for (i = 0; tmp1[i] != '\0'; i++)
-// 		str1[i] = tmp1[i];
-// 	str1[i] = '\0';	
-
-// 	str2 = (char*)syscall(SYS_brk, 0);
-// 	syscall(SYS_brk, (long long int)str2 + PGSIZE);
-// 	for (i = 0; tmp2[i] != '\0'; i++)
-// 		str2[i] = tmp2[i];
-// 	str2[i] = '\0';	
-
-// 	syscall(SYS_print_str, "\n--------test begin--------\n");
-// 	pid = syscall(SYS_fork);
-
-// 	if (pid == 0) { // 子进程
-// 		syscall(SYS_print_str, "child proc: hello!\n");
-// 		syscall(SYS_print_str, str1);
-// 		syscall(SYS_print_str, str2);
-// 		syscall(SYS_print_str, str3);
-// 		syscall(SYS_exit, 1234);
-// 	} else { // 父进程
-// 		int exit_state = 0;
-// 		syscall(SYS_wait, &exit_state);
-// 		syscall(SYS_print_str, "parent proc: hello!\n");
-// 		syscall(SYS_print_int, pid);
-// 		if (exit_state == 1234)
-// 			syscall(SYS_print_str, "good boy!\n");
-// 		else
-// 			syscall(SYS_print_str, "bad boy!\n"); 
-// 	}
-
-// 	syscall(SYS_print_str, "--------test end----------\n");
-
-// 	while (1);
-	
-// 	return 0;
-// }
-
-// test-4: sleep
-// #include "sys.h"
-
-// int main()
-// {
-// 	int pid = syscall(SYS_fork);
-// 	if (pid == 0) {
-// 		syscall(SYS_print_str, "Ready to sleep!\n");
-// 		syscall(SYS_sleep, 30);
-// 		syscall(SYS_print_str, "Ready to exit!\n");
-// 		syscall(SYS_exit, 0);
-// 	} else {
-// 		syscall(SYS_wait, 0);
-// 		syscall(SYS_print_str, "Child exit!\n");
-// 	}
-// 	while(1);
+//     char data[PGSIZE], tmp[PGSIZE];
+//     unsigned long long buffer[N_BUFFER];
+//
+//     for (int i = 0; i < 8; i++)
+//         data[i] = 'A' + i;
+//     data[8] = '\n';
+//     data[9] = '\0';
+//
+//     syscall(SYS_print_str, "\nstate-1 ");
+//     syscall(SYS_show_buffer);
+//
+//     buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
+//     syscall(SYS_write_block, buffer[0], data);
+//     syscall(SYS_put_block, buffer[0]);
+//
+//     syscall(SYS_print_str, "\nstate-2 ");
+//     syscall(SYS_show_buffer);
+//
+//     syscall(SYS_flush_buffer, N_BUFFER);
+//
+//     buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
+//     syscall(SYS_read_block, buffer[0], tmp);
+//     syscall(SYS_put_block, buffer[0]);
+//
+//     syscall(SYS_print_str, "\nwrite data: ");
+//     syscall(SYS_print_str, data);
+//     syscall(SYS_print_str, "read data: ");
+//     syscall(SYS_print_str, tmp);
+//
+//     syscall(SYS_print_str, "\nstate-3 ");
+//     syscall(SYS_show_buffer);
+//
+//     buffer[0] = syscall(SYS_get_block, BLOCK_BASE);
+//     buffer[3] = syscall(SYS_get_block, BLOCK_BASE + 3);
+//     buffer[7] = syscall(SYS_get_block, BLOCK_BASE + 7);
+//     buffer[2] = syscall(SYS_get_block, BLOCK_BASE + 2);
+//     buffer[4] = syscall(SYS_get_block, BLOCK_BASE + 4);
+//
+//     syscall(SYS_print_str, "\nstate-4 ");
+//     syscall(SYS_show_buffer);
+//
+//     syscall(SYS_put_block, buffer[7]);
+//     syscall(SYS_put_block, buffer[0]);
+//     syscall(SYS_put_block, buffer[4]);
+//
+//     syscall(SYS_print_str, "\nstate-5 ");
+//     syscall(SYS_show_buffer);
+//
+//     syscall(SYS_flush_buffer, 3);
+//
+//     syscall(SYS_print_str, "\nstate-6 ");
+//     syscall(SYS_show_buffer);
+//
+//     while (1);
 // }

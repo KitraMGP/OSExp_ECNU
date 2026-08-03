@@ -7,3 +7,4 @@
 #include "../mem/mod.h"
 #include "../syscall/mod.h"
 #include "../proc/mod.h"
+#include "../fs/mod.h"

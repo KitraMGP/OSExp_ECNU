@@ -1,309 +1,157 @@
-# LAB-6: 单进程走向多进程 - 进程调度与生命周期
+# LAB-7: 文件系统 之 磁盘管理
 
-## 1. 实验目标
+**前言**
 
-LAB-4 创建第一个用户进程 `proczero`，LAB-5 建立系统调用和用户地址空间。本实验将内核从单进程扩展为多进程系统，完成：
+本次实验我们将围绕磁盘管理构建文件系统的基础设施
 
-- 以固定进程数组管理进程资源和 PID。
-- 通过循环扫描调度器运行多个 `RUNNABLE` 进程。
-- 通过时钟中断实现抢占式时间片调度。
-- 支持 `fork`、`exit`、`wait` 的进程生命周期。
-- 支持 `sleep`/`wakeup` 以及基于其构建的睡眠锁。
-- 为用户态提供打印、PID、进程和睡眠系统调用。
+1. 首先讨论QEMU启动时的输入参数disk.img是如何构建的
 
-## 2. 代码结构
+2. 随后讨论以block为基本单位的磁盘读写如何实现, 包括驱动本身+OS提供的配合
+
+3. 随后讨论磁盘与内存进行数据交换的桥梁--缓冲系统(buffer)
+
+4. 最后讨论磁盘上bitmap区域的管理方法
+
+## 代码组织结构
 
 ```text
-src/kernel/
-├── lock/
-│   ├── spinlock.c      自旋锁和中断嵌套控制
-│   └── sleeplock.c     等待资源时阻塞的睡眠锁
-├── mem/
-│   ├── kvm.c           为 N_PROC 个槽位映射内核栈与保护页
-│   └── uvm.c           用户页表复制和销毁
-├── proc/
-│   ├── proc.c          进程仓库、调度、生命周期、睡眠唤醒
-│   ├── swtch.S         保存/恢复内核 callee-saved 寄存器
-│   └── type.h          proc_t、context_t、trapframe_t、进程状态
-├── syscall/
-│   ├── syscall.c       syscall number 到服务函数的分派
-│   └── sysfunc.c       进程和打印系统调用实现
-└── trap/
-    ├── timer.c         系统 tick、定时等待与时钟唤醒
-    ├── trap_kernel.c   内核态时钟中断抢占
-    └── trap_user.c     用户态时钟中断抢占
-src/user/initcode.c     当前启用测试 1；测试 2-4 保留为注释
+OSExp_ECNU
+├── Makefile       CHANGE: 构建 disk.img 并挂载 VirtIO 块设备
+├── README.md      本实验报告与任务说明
+├── picture         LAB-7 原理图与参考输出图
+└── src
+    ├── kernel
+    │   ├── fs
+    │   │   ├── bitmap.c   TODO: bitmap 申请、释放与显示
+    │   │   ├── buf.c      TODO: buffer cache、LRU、读写与释放
+    │   │   ├── fs.c       TODO: buffer 初始化并读取 superblock
+    │   │   ├── virtio.c   NEW: VirtIO 块设备驱动
+    │   │   ├── method.h   NEW: 文件系统接口
+    │   │   ├── mod.h      NEW: 文件系统聚合头
+    │   │   └── type.h     NEW: 磁盘、buffer、superblock 类型
+    │   ├── mem
+    │   │   └── kvm.c      TODO: VirtIO MMIO 映射与 NULL 页表处理
+    │   ├── proc
+    │   │   └── proc.c     TODO: proc_return 中调用 fs_init
+    │   ├── syscall
+    │   │   ├── syscall.c  TODO: 11-21 号系统调用分派
+    │   │   └── sysfunc.c  TODO: bitmap 与 buffer 系统调用
+    │   ├── trap
+    │   │   ├── plic.c         TODO: 使能 VirtIO 中断
+    │   │   └── trap_kernel.c  TODO: 响应 VirtIO 外设中断
+    │   └── main.c         CHANGE: CPU-0 调用 virtio_disk_init
+    ├── mkfs
+    │   ├── mkfs.c         NEW: Linux 主机侧磁盘格式化工具
+    │   └── mkfs.h         NEW: disk.img 磁盘布局
+    └── user
+        ├── initcode.c     CHANGE: LAB-7 测试用例
+        └── syscall_num.h  CHANGE: 11-21 号用户系统调用
 ```
 
-## 3. 进程资源仓库
+**标记说明**
 
-`proc_list[N_PROC]` 是固定进程仓库；每个槽位永久对应一个内核栈虚拟地址 `KSTACK(i)`。`kvm_init` 为每个槽位分配一页内核物理页并映射，两个相邻内核栈之间保留一页未映射保护页。
+- **NEW**：直接引入的新增文件。
+- **CHANGE**：实验提供的接口、构建或测试更新，已迁移。
+- **TODO**：本实验需要完成的功能；迁移阶段仅保留骨架，不应以模板覆盖前序实验的实现。
 
-`proc_init` 初始化所有槽位、进程锁、PID 锁和 `proc_wait_lk`，并将 `global_pid` 置为 1。`proc_alloc` 顺序扫描 `UNUSED` 槽位，初始化通用字段，设置：
+## 实验目标
+
+1. 使用 `mkfs` 生成磁盘映像 `target/mkfs/disk.img`，其布局为：
+
+```text
+[ superblock | inode bitmap | inode region | data bitmap | data region ]
+```
+
+2. 启动 QEMU VirtIO 块设备，实现以 block 为单位的磁盘读写基础设施。
+3. 实现 buffer cache 的获取、释放、LRU 管理、磁盘读写和非活跃缓存物理页释放。
+4. 基于 buffer 实现 inode bitmap 和 data bitmap 的分配、回收与显示。
+5. 新增 11-21 号系统调用，支持用户态测试 bitmap 和 buffer 行为。
+
+## 已迁移内容
+
+- 新增 `src/kernel/fs/`：VirtIO 驱动和文件系统模块接口/骨架。
+- 新增 `src/mkfs/`：主机侧格式化工具，构建时生成 `disk.img`。
+- Makefile 已增加 disk image 生成规则，并通过 QEMU `virtio-blk-device` 挂载该映像。
+- 已接入 LAB-7 文件系统模块聚合头、VirtIO 初始化入口和用户侧 11-21 号系统调用编号。
+- `src/user/initcode.c` 已切换为 LAB-7 测试模板，默认测试仅打印 `hello, world!`，用于后续验证 `fs_init` 能读出超级块。
+
+## 待实现任务
+
+### 1. VirtIO 与内核集成
+
+- 在 `kvm_init` 映射 VirtIO MMIO 寄存器区域；使 `vm_getpte(NULL, ...)` 解析内核页表。
+- 在 PLIC 初始化与 per-hart 初始化中配置 `VIRTIO_IRQ`。
+- 在外设中断处理路径识别 `VIRTIO_IRQ` 并调用 `virtio_disk_intr`。
+- 在 `proc_return` 的首次用户进程上下文中调用 `fs_init`，不能在 `main` 中同步读盘，因为 I/O 会睡眠。
+
+### 2. Buffer cache
+
+- 完成 `buffer_init`、`buffer_get`、`buffer_put`、`buffer_write`、`buffer_freemem`。
+- 使用活跃/非活跃双向循环链表维护 LRU；最活跃 buffer 位于 `head->next`，最不活跃 buffer 位于 `head->prev`。
+- `block_num` 和 `ref` 由 `lk_buf_cache` 保护；`data` 和 `disk` 由每个 buffer 的睡眠锁保护。
+- block cache miss 时先从磁盘读取；未命中且无可复用非活跃 buffer 时应拒绝分配或按实验要求处理。
+
+`buffer_get` 命中时把节点移至活跃链表表头；从非活跃链表取得或复用最旧节点时也转入活跃链表。图示如下：
+
+![buffer_get 的 LRU 移动](./picture/LRU_get_operation.png)
+
+`buffer_put` 将引用计数递减；引用计数归零的节点移至非活跃链表表头，供后续复用或释放物理页：
+
+![buffer_put 的 LRU 移动](./picture/LRU_put_operation.png)
+
+### 3. Superblock 与 bitmap
+
+- `fs_init` 初始化 buffer cache、读入 block 0 的 superblock，并输出磁盘布局。
+- `bitmap_alloc_block` / `bitmap_free_block` 管理 data bitmap。
+- `bitmap_alloc_inode` / `bitmap_free_inode` 管理 inode bitmap。
+- 处理 bitmap 横跨多个 block 以及最后一个 bitmap block 的有效 bit 范围。
+
+### 4. 系统调用
+
+实现并接入：
 
 ```c
-proc->ctx.ra = (uint64)proc_return;
-proc->ctx.sp = proc->kstack + PGSIZE;
+SYS_alloc_block  11
+SYS_free_block   12
+SYS_alloc_inode  13
+SYS_free_inode   14
+SYS_show_bitmap  15
+SYS_get_block    16
+SYS_read_block   17
+SYS_write_block  18
+SYS_put_block    19
+SYS_show_buffer  20
+SYS_flush_buffer 21
 ```
 
-它返回时仍持有 `proc->lk`，调用者完成进程特有初始化后才设置 `RUNNABLE` 并解锁。`proc_free` 只能回收 `ZOMBIE` 进程；它归还 mmap 描述节点，销毁用户页表和 trapframe，最后转为 `UNUSED`。
+用户指针必须通过 `uvm_copyin` / `uvm_copyout` 访问，不能直接解引用。
 
-`proc_make_first` 使用 `proc_alloc` 创建 `proczero`，填充 initcode、用户栈、页表和 trapframe 后置为 `RUNNABLE`。它不直接切换上下文，首次执行由 scheduler 决定。
-
-## 4. 进程状态与调度
-
-### 4.1 状态机
-
-```text
-UNUSED --alloc/fork--> RUNNABLE --scheduler--> RUNNING
-  ^                                             |
-  |                                             | exit
-  |                                             v
-  +------------------------ wait/free -------- ZOMBIE
-
-RUNNING --yield/timer--> RUNNABLE
-RUNNING --sleep--------> SLEEPING --wakeup--> RUNNABLE
-```
-
-![进程状态转换](./pictures/proc_state.jpg)
-
-状态与其保护：
-
-| 字段 | 语义 | 保护方式 |
-|---|---|---|
-| `state` | 进程当前状态 | 对应 `proc->lk` |
-| `parent` | 父进程 | `proc_wait_lk` 与子进程锁 |
-| `exit_code` | 僵尸进程退出码 | 子进程锁 |
-| `sleep_space` | 当前等待对象/channel | 进程锁 |
-
-### 4.2 循环扫描 scheduler
-
-每个 hart 的原生执行流在 `main` 初始化完成后进入 `proc_scheduler()`。scheduler 循环扫描 `proc_list`：
-
-```text
-scheduler 获取 P->lk
-  P 为 RUNNABLE -> P.state = RUNNING, CPU->proc = P
-  swtch(&CPU->ctx, &P->ctx)
-  P 让出 CPU 后回到此处
-  CPU->proc = NULL，释放 P->lk
-```
-
-`swtch(old, new)` 先保存当前执行流的内核上下文至 `old`，再恢复 `new`。因此：
-
-```text
-scheduler -> process: swtch(&cpu->ctx, &proc->ctx)
-process -> scheduler: swtch(&proc->ctx, &cpu->ctx)
-```
-
-进程首次被运行时，其 `ctx.ra` 为 `proc_return`。该函数释放 scheduler 跨上下文转交的进程锁，再调用 `trap_user_return` 通过 `sret` 进入用户态。
-
-`proc_sched` 只能在持有当前进程锁、中断关闭且只保留一层 `push_off` 时调用。它切回 scheduler，由 scheduler 在返回点释放进程锁。
-
-### 4.3 时钟抢占
-
-M-mode 时钟中断转化为 S-mode software interrupt。用户态和内核态的 `trap_id == 1` 分支均先调用 `timer_interrupt_handler`，再在存在当前进程时调用 `proc_yield`：
-
-```text
-RUNNING -> RUNNABLE
-proc_sched() -> scheduler
-```
-
-scheduler 空闲运行时 `myproc() == NULL`，内核态时钟分支不会尝试抢占空进程。
-
-## 5. 生命周期: fork, exit, wait
-
-### 5.1 fork
-
-`proc_fork`：
-
-1. 通过 `proc_alloc` 申请子进程槽位。
-2. 分配子 trapframe，复制父 trapframe。
-3. 创建子用户页表，复制代码、堆、mmap 区域和用户栈的物理页。
-4. 逐个复制 mmap 描述节点，保持地址顺序。
-5. 设置 `child->parent = parent`、`child->tf->a0 = 0`。
-6. 设置子进程 `RUNNABLE`；父进程得到子 PID。
-
-父子返回值满足：父进程返回正 PID，子进程返回 0。
-
-### 5.2 exit 与 wait
-
-`proc_exit` 不释放当前进程自身资源。它持有 `proc_wait_lk` 和自身锁，写入 `exit_code`、将状态置为 `ZOMBIE`、过继其子进程给永不退出的 `proczero`，并唤醒等待自己的父进程；随后通过 `proc_sched` 永久离开执行流。
-
-`proc_wait` 持有 `proc_wait_lk` 扫描子进程：
-
-- 找到 `ZOMBIE` 子进程：通过 `uvm_copyout` 将退出码写入用户地址，调用 `proc_free`，返回子 PID。
-- 没有任何子进程：返回 `-1`。
-- 存在未退出子进程：以父进程指针为等待对象调用 `proc_sleep`。
-
-`proc_wait_lk` 使“扫描不到僵尸子进程”和“登记为等待者”成为一个受保护的连续操作，避免子进程在两者之间退出导致父进程永久错过唤醒。
-
-## 6. sleep, wakeup 与睡眠锁
-
-### 6.1 通用睡眠协议
-
-`proc_sleep(sleep_space, lock)` 的调用者已经持有用于检查资源条件的 `lock`。该函数的锁状态转换为：
-
-```text
-调用前: 持有 lock，不持有 proc->lk
-获取 proc->lk
-设置 sleep_space 和 SLEEPING
-释放 lock
-切换到 scheduler
-被唤醒并重新运行
-重新获取 lock
-释放 proc->lk
-返回后: 持有 lock，不持有 proc->lk
-```
-
-这样“设置 `SLEEPING`”先于“释放条件锁”，资源生产者不能在进程尚未登记为等待者时完成唤醒，从而避免 lost wakeup。
-
-`proc_wakeup(sleep_space)` 扫描进程表，将所有同时满足以下条件的进程转为 `RUNNABLE`：
-
-```c
-proc->state == SLEEPING && proc->sleep_space == sleep_space
-```
-
-### 6.2 定时睡眠
-
-`timer_wait(ntick)` 在持有 `sys_timer.lk` 时计算目标 tick：
-
-```c
-uint64 target = sys_timer.ticks + ntick;
-while (sys_timer.ticks < target)
-    proc_sleep(&sys_timer, &sys_timer.lk);
-```
-
-CPU-0 在 `timer_update` 中递增 `sys_timer.ticks` 后调用 `proc_wakeup(&sys_timer)`。被唤醒的进程重新获取时钟锁，检查目标是否已达到；未达到则再次睡眠。
-
-### 6.3 睡眠锁
-
-`sleeplock` 用内部自旋锁保护 `locked`、`pid` 和锁名称。获取者若发现锁已持有，以 sleeplock 自身为 `sleep_space` 睡眠；释放者清除占有者 PID 后调用 `proc_wakeup(lk)`。因此它适合未来文件系统等长时间持有的资源，避免自旋锁的忙等。
-
-## 7. 用户系统调用
-
-| 编号 | 调用 | 结果 |
-|---:|---|---|
-| 1 | `brk` | 调整或查询用户堆顶 |
-| 2 | `mmap` | 创建用户内存映射 |
-| 3 | `munmap` | 解除用户内存映射 |
-| 4 | `print_str` | 将用户字符串复制到内核缓冲区并打印 |
-| 5 | `print_int` | 打印 32 位有符号整数 |
-| 6 | `getpid` | 返回当前进程 PID |
-| 7 | `fork` | 创建子进程；父返回 PID，子返回 0 |
-| 8 | `wait` | 等待并回收子进程，返回其 PID |
-| 9 | `exit` | 设置退出码并成为僵尸进程，不返回 |
-| 10 | `sleep` | 睡眠指定 tick 数，1 tick 约 0.1 s |
-
-系统调用号从 `a7` 读取，参数位于 `a0`-`a5`，返回值写回 `a0`。用户字符串由 `arg_str` 和 `uvm_copyin_str` 访问；`wait` 的退出码地址由 `uvm_copyout` 写回，内核不直接解引用用户指针。
-
-## 8. 构建与运行
-
-在仓库根目录执行：
+## 构建与测试
 
 ```sh
 make build
 make run
 ```
 
-`make run` 启动双 hart、128 MiB RAM 的 QEMU `virt` 机器。用户测试程序位于 `src/user/initcode.c`；当前启用测试 1，测试 2-4 保留为注释块。切换测试后运行 `make run` 会重新生成 `src/user/initcode.h` 并构建内核。
-
-## 9. 测试与实际输出
-
-### 测试 1: getpid 与字符串打印
-
-```c
-int pid = syscall(SYS_getpid);
-if (pid == 1) {
-    syscall(SYS_print_str, "\nproczero: hello ");
-    syscall(SYS_print_str, "world!\n");
-}
-while (1);
-```
-
-实际输出：
+本次迁移已实际生成：
 
 ```text
-cpu 0 is booting!
-cpu 1 is booting!
-
-proczero: hello world!
+target/mkfs/mkfs
+target/mkfs/disk.img
 ```
 
-验证 `proczero` 创建、scheduler 首次切换、用户态 syscall、PID 返回和打印。
+完成 TODO 后，完整构建还会生成 `target/user/initcode.h` 和 `target/kernel/kernel-qemu.elf`。
 
-### 测试 2: 两次 fork
+测试前按需要在 `src/user/initcode.c` 切换测试 1、2 或 3；buffer LRU 测试应将 `N_BUFFER` 临时设为 `N_BUFFER_TEST`。完成实现后，README 应补充实际 QEMU 输出，不能记录计划输出或模板图片中的预期输出。
 
-```c
-syscall(SYS_print_str, "level-1!\n");
-syscall(SYS_fork);
-syscall(SYS_print_str, "level-2!\n");
-syscall(SYS_fork);
-syscall(SYS_print_str, "level-3!\n");
-while (1);
-```
+## 当前迁移状态
 
-实际输出：
+LAB-7 模板与构建资产已迁入；`target/mkfs/disk.img` 已由主机侧 mkfs 生成，大小为 4 GiB。
 
-```text
-level-1!
-level-2!
-level-2!
-level-3!
-level-3!
-level-3!
-level-3!
-```
+当前 `make build` 在 LAB-7 预留 TODO 处停止，具体为：
 
-验证第一次 fork 后有两个执行流，第二次 fork 后有四个最终执行流，以及 timer preemption 下的循环调度。
+- `src/kernel/fs/bitmap.c`：bitmap 搜索、申请和释放尚未实现。
+- `src/kernel/fs/buf.c`：buffer cache 获取与物理页释放尚未实现。
+- `src/kernel/fs/virtio.c`：尚未接入 `vm_getpte(NULL, ...)` 所需的内核页表解析。
 
-### 测试 3: fork, mmap, brk, wait, exit
-
-测试先在 mmap、堆和用户栈中分别写入字符串；子进程打印这些字符串并以 `1234` 退出；父进程 `wait` 后检查退出码。
-
-实际关键输出：
-
-```text
---------test begin--------
-child proc: hello!
-MMAP_REGION
-HEAP_REGION
-STACK_REGION
-
-parent proc: hello!
-2good boy!
---------test end----------
-```
-
-其中 `2` 是该次运行分配给子进程的 PID。该测试验证用户页表深复制、mmap 描述复制、exit/wait 退出码传递和僵尸回收。
-
-### 测试 4: 定时 sleep
-
-```c
-int pid = syscall(SYS_fork);
-if (pid == 0) {
-    syscall(SYS_print_str, "Ready to sleep!\n");
-    syscall(SYS_sleep, 30);
-    syscall(SYS_print_str, "Ready to exit!\n");
-    syscall(SYS_exit, 0);
-} else {
-    syscall(SYS_wait, 0);
-    syscall(SYS_print_str, "Child exit!\n");
-}
-while (1);
-```
-
-实际输出：
-
-```text
-Ready to sleep!
-Ready to exit!
-Child exit!
-```
-
-验证子进程在 30 tick 等待期间不参与调度、时钟唤醒、子进程退出和父进程 wait 唤醒。
-
-## 10. 完成情况与边界
-
-LAB-6 的进程仓库、内核栈映射、循环扫描调度、时钟抢占、fork/exit/wait、sleep/wakeup、睡眠锁和系统调用均已实现并通过上述端到端测试。
-
-本实验的 `fork` 采用立即复制用户物理页；不实现 copy-on-write。`proczero` 不允许退出；孤儿进程会被过继给它。磁盘、文件系统和 `exec` 不属于本实验，将在 LAB-7 至 LAB-9 引入。
+后续按指南完成 `kvm.c`、PLIC/外设中断、`proc_return -> fs_init`、buffer cache、bitmap 和新系统调用后，`make build` 与 `make run` 才构成完整 LAB-7 验收路径。
