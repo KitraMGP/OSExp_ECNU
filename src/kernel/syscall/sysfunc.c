@@ -103,7 +103,10 @@ uint64 sys_munmap()
 */
 uint64 sys_print_str()
 {
-    // TODO(lab-6)
+    char str[STR_MAXLEN + 1];
+    arg_str(0, str, STR_MAXLEN);
+    str[STR_MAXLEN] = '\0';
+    printf("%s", str);
     return 0;
 }
 
@@ -114,7 +117,9 @@ uint64 sys_print_str()
 */
 uint64 sys_print_int()
 {
-    // TODO(lab-6)
+    uint32 num;
+    arg_uint32(0, &num);
+    printf("%d", (int)num);
     return 0;
 }
 
@@ -124,8 +129,7 @@ uint64 sys_print_int()
 */
 uint64 sys_fork()
 {
-    // TODO(lab-6)
-    return 0;
+    return proc_fork();
 }
 
 /*
@@ -134,8 +138,9 @@ uint64 sys_fork()
 */
 uint64 sys_wait()
 {
-    // TODO(lab-6)
-    return 0;
+    uint64 addr;
+    arg_uint64(0, &addr);
+    return proc_wait(addr);
 }
 
 /*
@@ -145,7 +150,9 @@ uint64 sys_wait()
 */
 uint64 sys_exit()
 {
-    // TODO(lab-6): 调用proc_exit后不再返回, 此处为占位返回值
+    uint32 exit_code;
+    arg_uint32(0, &exit_code);
+    proc_exit((int)exit_code);
     return 0;
 }
 
@@ -156,7 +163,9 @@ uint64 sys_exit()
 */
 uint64 sys_sleep()
 {
-    // TODO(lab-6)
+    uint32 ntick;
+    arg_uint32(0, &ntick);
+    timer_wait(ntick);
     return 0;
 }
 
@@ -165,6 +174,7 @@ uint64 sys_sleep()
 */
 uint64 sys_getpid()
 {
-    // TODO(lab-6)
-    return 0;
+    proc_t *proc = myproc();
+    assert(proc != NULL, "sys_getpid: no current process.");
+    return proc->pid;
 }

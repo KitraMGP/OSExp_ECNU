@@ -3,12 +3,12 @@
 
 int main()
 {
-	int pid = syscall(SYS_getpid);
-	if (pid == 1) {
-		syscall(SYS_print_str, "\nproczero: hello ");
-		syscall(SYS_print_str, "world!\n");
-	}
-	while (1);	
+    int pid = syscall(SYS_getpid);
+    if (pid == 1) {
+        syscall(SYS_print_str, "\nproczero: hello ");
+        syscall(SYS_print_str, "world!\n");
+    }
+    while (1);
 }
 
 

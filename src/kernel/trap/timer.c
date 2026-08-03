@@ -57,7 +57,7 @@ void timer_update()
     spinlock_acquire(&sys_timer.lk);
     sys_timer.ticks++;
     spinlock_release(&sys_timer.lk);
-    // printf("ticks=%d\n", timer_get_ticks());
+    proc_wakeup(&sys_timer);
 }
 
 // 获取滴答数量 (不把sys_timer暴露出去, 只提供安全的访问接口)
@@ -73,6 +73,10 @@ uint64 timer_get_ticks()
 // 让进程睡眠ntick个时钟周期
 void timer_wait(uint64 ntick)
 {
-    // TODO(lab-6): 以sys_timer为资源进入睡眠, 等待timer_update唤醒后检查时间
+    spinlock_acquire(&sys_timer.lk);
+    uint64 target = sys_timer.ticks + ntick;
+    while (sys_timer.ticks < target)
+        proc_sleep(&sys_timer, &sys_timer.lk);
+    spinlock_release(&sys_timer.lk);
 }
 

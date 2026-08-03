@@ -22,6 +22,7 @@ static proc_t *proczero;
 // 全局pid + 保护它的锁
 static int global_pid;
 static spinlock_t pid_lk;
+static spinlock_t proc_wait_lk;
 
 /* 获取一个pid */
 static int alloc_pid()
@@ -47,6 +48,7 @@ static void proc_return()
 void proc_init()
 {
     spinlock_init(&pid_lk, "pid");
+    spinlock_init(&proc_wait_lk, "proc_wait");
     global_pid = 1;
 
     for (int i = 0; i < N_PROC; i++)
@@ -198,9 +200,39 @@ void proc_make_first()
 */
 int proc_fork()
 {
-    // TODO(lab-6): 申请进程结构体, 复制父进程资源, 记录父子关系,
-    // 子进程返回值置0
-    return 0;
+    proc_t *parent = myproc();
+    proc_t *child;
+
+    assert(parent != NULL, "proc_fork: no current process.");
+    child = proc_alloc();
+    if (child == NULL)
+        return -1;
+
+    child->tf = (trapframe_t *)pmem_alloc(false);
+    memmove(child->tf, parent->tf, sizeof(*child->tf));
+    child->pgtbl = proc_pgtbl_init((uint64)child->tf);
+    uvm_copy_pgtbl(parent->pgtbl, child->pgtbl,
+                   parent->heap_top, parent->ustack_npage, parent->mmap);
+    child->heap_top = parent->heap_top;
+    child->ustack_npage = parent->ustack_npage;
+    child->mmap = NULL;
+    mmap_region_t **tail = &child->mmap;
+    for (mmap_region_t *src = parent->mmap; src != NULL; src = src->next)
+    {
+        mmap_region_t *copy = mmap_region_alloc();
+        copy->begin = src->begin;
+        copy->npages = src->npages;
+        copy->next = NULL;
+        *tail = copy;
+        tail = &copy->next;
+    }
+
+    child->parent = parent;
+    child->tf->a0 = 0;
+    child->state = RUNNABLE;
+    int pid = child->pid;
+    spinlock_release(&child->lk);
+    return pid;
 }
 
 /*
@@ -225,28 +257,58 @@ void proc_yield()
 */
 static void proc_reparent(proc_t *parent)
 {
+    for (int i = 0; i < N_PROC; i++)
+    {
+        proc_t *child = &proc_list[i];
+        if (child == parent || child == proczero)
+            continue;
 
+        spinlock_acquire(&child->lk);
+        if (child->state != UNUSED && child->parent == parent)
+            child->parent = proczero;
+        spinlock_release(&child->lk);
+    }
 }
 
-/*
-    唤醒等待呼叫的进程
-    由proc_exit调用
-    tips: 调用者需要持有p的进程锁
-*/
+/* 唤醒等待父进程的wait调用。调用者持有p->lk。 */
 static void proc_try_wakeup(proc_t *p)
 {
-
+    assert(p != NULL, "proc_try_wakeup: NULL process.");
+    assert(spinlock_holding(&p->lk), "proc_try_wakeup: process lock not held.");
+    if (p->state == SLEEPING && p->sleep_space == p)
+    {
+        p->sleep_space = NULL;
+        p->state = RUNNABLE;
+    }
 }
-
 /*
     进程退出
     RUNNING -> ZOMBIE
 */
 void proc_exit(int exit_code)
 {
+    proc_t *proc = myproc();
+    proc_t *parent;
 
+    assert(proc != NULL, "proc_exit: no current process.");
+    assert(proc != proczero, "proc_exit: proczero cannot exit.");
+
+    spinlock_acquire(&proc_wait_lk);
+    spinlock_acquire(&proc->lk);
+    proc->exit_code = exit_code;
+    proc->state = ZOMBIE;
+    parent = proc->parent;
+    proc_reparent(proc);
+    if (parent != NULL)
+    {
+        spinlock_acquire(&parent->lk);
+        proc_try_wakeup(parent);
+        spinlock_release(&parent->lk);
+    }
+    spinlock_release(&proc_wait_lk);
+    proc_sched();
+    panic("proc_exit: returned from scheduler.");
 }
-
 /*
     父进程等待一个子进程进入ZOMBIE状态
     1. 如果等到: 释放子进程, 返回子进程的pid, 将子进程的退出状态传出到user_addr
@@ -255,8 +317,46 @@ void proc_exit(int exit_code)
 */
 int proc_wait(uint64 user_addr)
 {
-    // TODO(lab-6): 扫描proc_list等待ZOMBIE子进程, 用proc_free回收
-    return 0;
+    proc_t *parent = myproc();
+
+    assert(parent != NULL, "proc_wait: no current process.");
+    spinlock_acquire(&proc_wait_lk);
+    for (;;)
+    {
+        bool have_child = false;
+        for (int i = 0; i < N_PROC; i++)
+        {
+            proc_t *child = &proc_list[i];
+            if (child == parent)
+                continue;
+
+            spinlock_acquire(&child->lk);
+            if (child->state != UNUSED && child->parent == parent)
+            {
+                have_child = true;
+                if (child->state == ZOMBIE)
+                {
+                    int pid = child->pid;
+                    int exit_code = child->exit_code;
+                    if (user_addr != 0)
+                        uvm_copyout(parent->pgtbl, user_addr,
+                                    (uint64)&exit_code, sizeof(exit_code));
+                    proc_free(child);
+                    spinlock_release(&child->lk);
+                    spinlock_release(&proc_wait_lk);
+                    return pid;
+                }
+            }
+            spinlock_release(&child->lk);
+        }
+
+        if (!have_child)
+        {
+            spinlock_release(&proc_wait_lk);
+            return -1;
+        }
+        proc_sleep(parent, &proc_wait_lk);
+    }
 }
 
 /*
@@ -265,7 +365,19 @@ int proc_wait(uint64 user_addr)
 */
 void proc_sleep(void *sleep_space, spinlock_t *lock)
 {
+    proc_t *proc = myproc();
 
+    assert(proc != NULL, "proc_sleep: no current process.");
+    assert(lock != NULL, "proc_sleep: NULL lock.");
+    assert(!spinlock_holding(&proc->lk), "proc_sleep: process lock already held.");
+
+    spinlock_acquire(&proc->lk);
+    proc->sleep_space = sleep_space;
+    proc->state = SLEEPING;
+    spinlock_release(lock);
+    proc_sched();
+    spinlock_acquire(lock);
+    spinlock_release(&proc->lk);
 }
 
 /*
@@ -274,7 +386,17 @@ void proc_sleep(void *sleep_space, spinlock_t *lock)
 */
 void proc_wakeup(void *sleep_space)
 {
-
+    for (int i = 0; i < N_PROC; i++)
+    {
+        proc_t *proc = &proc_list[i];
+        spinlock_acquire(&proc->lk);
+        if (proc->state == SLEEPING && proc->sleep_space == sleep_space)
+        {
+            proc->sleep_space = NULL;
+            proc->state = RUNNABLE;
+        }
+        spinlock_release(&proc->lk);
+    }
 }
 
 /*
